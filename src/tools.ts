@@ -8,9 +8,9 @@ import {
   cfRequest,
   cfRequestText,
   formatRecordLine,
-  resolveZone,
   slimRecord,
   truncate,
+  withZone,
 } from "./cloudflare.js";
 
 /** All DNS record types Cloudflare accepts via the API. */
@@ -189,27 +189,28 @@ Returns per record: id, type, name, content, ttl (1 = Auto), proxied, priority, 
     },
     async ({ zone, type, name, name_contains, content, page, per_page }): Promise<ToolResult> => {
       try {
-        const zn = await resolveZone(zone);
-        const { result, result_info } = await cfRequest<DnsRecord[]>("GET", `/zones/${zn.id}/dns_records`, {
-          query: {
-            type,
-            name,
-            "name.contains": name_contains,
-            content,
-            page,
-            per_page,
-          },
+        return await withZone(zone, async (zn) => {
+          const { result, result_info } = await cfRequest<DnsRecord[]>("GET", `/zones/${zn.id}/dns_records`, {
+            query: {
+              type,
+              name,
+              "name.contains": name_contains,
+              content,
+              page,
+              per_page,
+            },
+          });
+          const records = result.map(slimRecord);
+          const total = result_info?.total_count ?? records.length;
+          const hasMore = result_info ? result_info.page * result_info.per_page < total : false;
+          const header = `Zone ${zn.name} — ${total} matching record(s), showing ${records.length} (page ${page}):`;
+          const text =
+            records.length === 0
+              ? `Zone ${zn.name} has no DNS records matching those filters.`
+              : `${header}\n${records.map(formatRecordLine).join("\n")}` +
+                (hasMore ? `\nMore pages available — call again with page=${page + 1}.` : "");
+          return ok(text, { zone: { id: zn.id, name: zn.name }, total, count: records.length, page, records, has_more: hasMore });
         });
-        const records = result.map(slimRecord);
-        const total = result_info?.total_count ?? records.length;
-        const hasMore = result_info ? result_info.page * result_info.per_page < total : false;
-        const header = `Zone ${zn.name} — ${total} matching record(s), showing ${records.length} (page ${page}):`;
-        const text =
-          records.length === 0
-            ? `Zone ${zn.name} has no DNS records matching those filters.`
-            : `${header}\n${records.map(formatRecordLine).join("\n")}` +
-              (hasMore ? `\nMore pages available — call again with page=${page + 1}.` : "");
-        return ok(text, { zone: { id: zn.id, name: zn.name }, total, count: records.length, page, records, has_more: hasMore });
       } catch (err) {
         return fail(err);
       }
@@ -231,9 +232,10 @@ Args:
     },
     async ({ zone, record_id }): Promise<ToolResult> => {
       try {
-        const zn = await resolveZone(zone);
-        const record = slimRecord(await getRecord(zn, record_id));
-        return ok(`${formatRecordLine(record)}`, { zone: { id: zn.id, name: zn.name }, record });
+        return await withZone(zone, async (zn) => {
+          const record = slimRecord(await getRecord(zn, record_id));
+          return ok(`${formatRecordLine(record)}`, { zone: { id: zn.id, name: zn.name }, record });
+        });
       } catch (err) {
         return fail(err);
       }
@@ -294,23 +296,24 @@ Examples:
         if (type === "MX" && priority === undefined) {
           throw new CloudflareApiError("MX records require 'priority' (e.g. 10).");
         }
-        const zn = await resolveZone(zone);
-        const { result } = await cfRequest<DnsRecord>("POST", `/zones/${zn.id}/dns_records`, {
-          body: {
-            type,
-            name,
-            ...(content !== undefined ? { content } : {}),
-            ...(data !== undefined ? { data } : {}),
-            ttl,
-            ...(PROXYABLE_TYPES.has(type) ? { proxied } : {}),
-            ...(priority !== undefined ? { priority } : {}),
-            ...(comment !== undefined ? { comment } : {}),
-          },
-        });
-        const record = slimRecord(result);
-        return ok(`Created in ${zn.name}:\n${formatRecordLine(record)}`, {
-          zone: { id: zn.id, name: zn.name },
-          record,
+        return await withZone(zone, async (zn) => {
+          const { result } = await cfRequest<DnsRecord>("POST", `/zones/${zn.id}/dns_records`, {
+            body: {
+              type,
+              name,
+              ...(content !== undefined ? { content } : {}),
+              ...(data !== undefined ? { data } : {}),
+              ttl,
+              ...(PROXYABLE_TYPES.has(type) ? { proxied } : {}),
+              ...(priority !== undefined ? { priority } : {}),
+              ...(comment !== undefined ? { comment } : {}),
+            },
+          });
+          const record = slimRecord(result);
+          return ok(`Created in ${zn.name}:\n${formatRecordLine(record)}`, {
+            zone: { id: zn.id, name: zn.name },
+            record,
+          });
         });
       } catch (err) {
         return fail(err);
@@ -367,24 +370,25 @@ Returns both the record's state BEFORE and AFTER the change, so the edit can be 
         if (Object.keys(patch).length === 0) {
           throw new CloudflareApiError("No fields to update — pass at least one of type/name/content/data/ttl/proxied/priority/comment.");
         }
-        const zn = await resolveZone(zone);
-        const before = slimRecord(await getRecord(zn, record_id));
-        const effectiveType = (patch.type as string | undefined) ?? before.type;
-        if (patch.type === "MX" && patch.priority === undefined && before.priority === undefined) {
-          throw new CloudflareApiError("MX records require 'priority' (e.g. 10).");
-        }
-        if (patch.proxied === true && !PROXYABLE_TYPES.has(effectiveType)) {
-          throw new CloudflareApiError(`'proxied' is only valid for A, AAAA, and CNAME records (got type=${effectiveType}). Set proxied=false.`);
-        }
-        const { result } = await cfRequest<DnsRecord>("PATCH", `/zones/${zn.id}/dns_records/${record_id}`, {
-          body: patch,
+        return await withZone(zone, async (zn) => {
+          const before = slimRecord(await getRecord(zn, record_id));
+          const effectiveType = (patch.type as string | undefined) ?? before.type;
+          if (patch.type === "MX" && patch.priority === undefined && before.priority === undefined) {
+            throw new CloudflareApiError("MX records require 'priority' (e.g. 10).");
+          }
+          if (patch.proxied === true && !PROXYABLE_TYPES.has(effectiveType)) {
+            throw new CloudflareApiError(`'proxied' is only valid for A, AAAA, and CNAME records (got type=${effectiveType}). Set proxied=false.`);
+          }
+          const { result } = await cfRequest<DnsRecord>("PATCH", `/zones/${zn.id}/dns_records/${record_id}`, {
+            body: patch,
+          });
+          const after = slimRecord(result);
+          return ok(
+            `Updated record in ${zn.name}.\nBefore: ${formatRecordLine(before)}\nAfter:  ${formatRecordLine(after)}\n` +
+              "(To revert, call cloudflare_update_dns_record again with the 'before' values.)",
+            { zone: { id: zn.id, name: zn.name }, before, after },
+          );
         });
-        const after = slimRecord(result);
-        return ok(
-          `Updated record in ${zn.name}.\nBefore: ${formatRecordLine(before)}\nAfter:  ${formatRecordLine(after)}\n` +
-            "(To revert, call cloudflare_update_dns_record again with the 'before' values.)",
-          { zone: { id: zn.id, name: zn.name }, before, after },
-        );
       } catch (err) {
         return fail(err);
       }
@@ -418,14 +422,15 @@ Deleting live DNS can take a website or email offline — verify the exact recor
         if (confirm !== true) {
           throw new CloudflareApiError("Deletion not confirmed. Re-call with confirm=true after verifying the record.");
         }
-        const zn = await resolveZone(zone);
-        const snapshot = slimRecord(await getRecord(zn, record_id));
-        await cfRequest<{ id: string }>("DELETE", `/zones/${zn.id}/dns_records/${record_id}`);
-        return ok(
-          `Deleted from ${zn.name}:\n${formatRecordLine(snapshot)}\n` +
-            "(To restore, recreate it with cloudflare_create_dns_record using the values above.)",
-          { zone: { id: zn.id, name: zn.name }, deleted: snapshot },
-        );
+        return await withZone(zone, async (zn) => {
+          const snapshot = slimRecord(await getRecord(zn, record_id));
+          await cfRequest<{ id: string }>("DELETE", `/zones/${zn.id}/dns_records/${record_id}`);
+          return ok(
+            `Deleted from ${zn.name}:\n${formatRecordLine(snapshot)}\n` +
+              "(To restore, recreate it with cloudflare_create_dns_record using the values above.)",
+            { zone: { id: zn.id, name: zn.name }, deleted: snapshot },
+          );
+        });
       } catch (err) {
         return fail(err);
       }
@@ -448,13 +453,14 @@ Returns the zone file as plain text (very large zones may be truncated; a trunca
     },
     async ({ zone }): Promise<ToolResult> => {
       try {
-        const zn = await resolveZone(zone);
-        const text = await cfRequestText("GET", `/zones/${zn.id}/dns_records/export`);
-        return ok(
-          `BIND zone file for ${zn.name}:\n\n${text}`,
-          { zone: { id: zn.id, name: zn.name } },
-          "this export was cut off and is an INCOMPLETE backup — do NOT restore from it. Export the full zone file from the Cloudflare dashboard (DNS → Records → Export) or the API directly.",
-        );
+        return await withZone(zone, async (zn) => {
+          const text = await cfRequestText("GET", `/zones/${zn.id}/dns_records/export`);
+          return ok(
+            `BIND zone file for ${zn.name}:\n\n${text}`,
+            { zone: { id: zn.id, name: zn.name } },
+            "this export was cut off and is an INCOMPLETE backup — do NOT restore from it. Export the full zone file from the Cloudflare dashboard (DNS → Records → Export) or the API directly.",
+          );
+        });
       } catch (err) {
         return fail(err);
       }

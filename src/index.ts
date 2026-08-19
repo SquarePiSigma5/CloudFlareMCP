@@ -9,6 +9,7 @@
  * Environment:
  *   CLOUDFLARE_API_TOKEN  (required)  scoped Cloudflare API token (Zone → DNS → Edit)
  *   MCP_AUTH_TOKEN        (optional)  if set, HTTP clients must send `Authorization: Bearer <token>`
+ *   ALLOW_UNAUTHENTICATED (optional)  'true' permits a non-loopback bind without MCP_AUTH_TOKEN (auth must be terminated upstream)
  *   HOST                  (optional)  bind address, default 127.0.0.1
  *   PORT                  (optional)  default 8787
  *   TRANSPORT             (optional)  'http' (default) or 'stdio'
@@ -141,14 +142,24 @@ async function runHttp(): Promise<void> {
   const host = process.env.HOST ?? "127.0.0.1";
   const port = Number.parseInt(process.env.PORT ?? "8787", 10);
 
-  // Normalize only for the warning decision — app.listen still gets the user's original HOST.
+  // Normalize only for the auth-guard decision — app.listen still gets the user's original HOST.
   const normalizedHost = host.trim().toLowerCase();
   const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
   if (!authToken && !LOOPBACK_HOSTS.has(normalizedHost)) {
-    log(
-      "WARNING: server is binding to a non-localhost address without MCP_AUTH_TOKEN set. " +
-        "Anyone who can reach this port can edit your DNS. Set MCP_AUTH_TOKEN before exposing it.",
-    );
+    if (process.env.ALLOW_UNAUTHENTICATED === "true") {
+      log(
+        "WARNING: server is binding to a non-localhost address without MCP_AUTH_TOKEN set. " +
+          "Anyone who can reach this port can edit your DNS. Set MCP_AUTH_TOKEN before exposing it. " +
+          "ALLOW_UNAUTHENTICATED=true is set, so starting anyway — make sure auth is terminated upstream.",
+      );
+    } else {
+      log(
+        "ERROR: refusing to start. Binding a non-localhost address without MCP_AUTH_TOKEN set would let " +
+          "anyone who can reach this port edit your DNS. Set MCP_AUTH_TOKEN, or set ALLOW_UNAUTHENTICATED=true " +
+          "only when auth is terminated upstream (e.g. Cloudflare Access in front of a tunnel).",
+      );
+      process.exit(1);
+    }
   }
 
   const httpServer = app.listen(port, host, () => {
