@@ -5,11 +5,13 @@ import {
   DnsRecord,
   SlimRecord,
   Zone,
+  cfApiPassthrough,
   cfRequest,
   cfRequestText,
   formatRecordLine,
   slimRecord,
   truncate,
+  validateApiPath,
   withZone,
 } from "./cloudflare.js";
 
@@ -39,6 +41,32 @@ const RECORD_TYPES = [
 ] as const;
 
 const PROXYABLE_TYPES = new Set(["A", "AAAA", "CNAME"]);
+
+/** HTTP methods the raw passthrough accepts. GET/HEAD are reads; the rest are writes. */
+const PASSTHROUGH_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] as const;
+const MUTATING_METHODS = new Set<string>(["POST", "PUT", "PATCH", "DELETE"]);
+
+/** Passthrough permission modes, resolved from CLOUDFLARE_API_PASSTHROUGH at call time. */
+type PassthroughMode = "off" | "read" | "full";
+
+/**
+ * Resolve the passthrough mode from the raw env value.
+ *
+ * Reads-on by default: unset/undefined, "read", an empty or whitespace-padded string, and any
+ * unrecognized or mistyped value all resolve to "read" (GET/HEAD passthrough). An EXACT "off"
+ * disables the tool entirely; an EXACT "full" additionally enables writes (each still requiring
+ * confirm=true). Only an exact "full" ever yields write access: the "full" comparison runs BEFORE
+ * any trimming, so a mistyped value like "Full", "FULL ", " full", or "fulll" degrades to
+ * reads-only ("read"), NEVER "full" — a typo can therefore never widen to write access.
+ * Note that even "read" exposes every GET/HEAD endpoint the token can reach, not just DNS.
+ */
+export function resolvePassthroughMode(raw: string | undefined): PassthroughMode {
+  if (raw === "off") return "off";
+  if (raw === "full") return "full";
+  // Unset, "read", or any other value → reads-only default. Writes require an EXACT "full",
+  // so a mistyped value can never widen to write access.
+  return "read";
+}
 
 const zoneParam = z
   .string()
@@ -466,6 +494,118 @@ Returns the zone file as plain text (very large zones may be truncated; a trunca
       }
     },
   );
+
+  // ------------------------------------------------------------------
+  // Registered unconditionally (even when disabled) so the mode can be read at CALL time, not
+  // build time — this keeps behaviour test-friendly and lets an operator flip the env var without
+  // restarting to change the registered tool set. Tradeoff: a DNS-only ('off') deployment still
+  // advertises this tool in tools/list; it just refuses every call. An operator who wants the
+  // capability to disappear entirely should run a separate, DNS-only server instance.
+  server.registerTool(
+    "cloudflare_api_request",
+    {
+      title: "Cloudflare API Request (guarded passthrough)",
+      description: `Make a raw, authenticated request to ANY Cloudflare v4 API endpoint the server's token can reach — NOT just DNS. Use this only for Cloudflare operations the typed cloudflare_* DNS tools don't cover; prefer those tools whenever they fit (they validate inputs and return revertable before/after states).
+
+This reaches the WHOLE Cloudflare API surface the token permits: reads like /user (account email), /accounts/{id}/members, audit logs, Workers, and Access/Zero Trust config; and, when writes are enabled, irreversible or account-wide actions such as DELETE /zones/{id} (deletes a zone and all its records/settings), API token creation/revocation, member/Access changes, and billing-affecting purchases. Treat it accordingly.
+
+Args:
+  - method (string): GET, HEAD, POST, PUT, PATCH, or DELETE. GET/HEAD are reads; POST/PUT/PATCH/DELETE are writes.
+  - path (string): a v4 API path RELATIVE to https://api.cloudflare.com/client/v4, beginning with '/', e.g. '/zones' or '/zones/{zone_id}/purge_cache'. Absolute URLs, other hosts, and paths that escape the v4 base are refused.
+  - query (optional object): query-string params, e.g. { per_page: 50, name: 'example.com' }.
+  - body (optional object): JSON request body for write methods.
+  - confirm (optional boolean): MUST be true for any write method.
+
+Permission model (operator-controlled env var CLOUDFLARE_API_PASSTHROUGH, read fresh on each call):
+  - unset / 'read' / anything unrecognized → GET/HEAD allowed; writes refused. This is the default (reads on).
+  - 'full' → GET/HEAD allowed, and writes allowed only when confirm=true.
+  - 'off' → the tool is disabled and every call is refused.
+
+Safety: confirm=true is set by the model in its own tool call — it is NOT a verified human approval and provides no per-caller authorization. Once an operator sets 'full', any content that can steer this model (a fetched page, a DNS TXT record, an email) could induce a catastrophic call; confirm only guards against calling a write by accident. Non-JSON/binary responses (cert/PEM downloads, raw zone-file exports, Worker script source) are out of scope — use the typed tools or the dashboard for those.`,
+      inputSchema: {
+        method: z
+          .enum(PASSTHROUGH_METHODS)
+          .describe("HTTP method. GET/HEAD are reads; POST/PUT/PATCH/DELETE are writes (need CLOUDFLARE_API_PASSTHROUGH=full and confirm=true)."),
+        path: z
+          .string()
+          .min(1)
+          .describe(
+            "Cloudflare v4 API path RELATIVE to https://api.cloudflare.com/client/v4, beginning with '/'. E.g. '/zones' or '/zones/{zone_id}/purge_cache'. Absolute URLs and other hosts are refused.",
+          ),
+        query: z
+          .record(z.union([z.string(), z.number()]))
+          .optional()
+          .describe("Optional query-string parameters, e.g. { per_page: 50, name: 'example.com' }."),
+        body: z.record(z.unknown()).optional().describe("Optional JSON request body for write methods (POST/PUT/PATCH)."),
+        // Strict boolean ON PURPOSE — never z.coerce.boolean(), which treats the string "false" as
+        // true (Boolean("false") === true) and would silently defeat this confirmation gate when an
+        // MCP client or model sends confirm as a string.
+        confirm: z
+          .boolean()
+          .optional()
+          .describe("Must be true for mutating methods (POST/PUT/PATCH/DELETE). Acknowledges a write to the live Cloudflare account."),
+      },
+      // It CAN write (not read-only), writes may be destructive/irreversible, non-idempotent overall,
+      // and it reaches an open, external world of endpoints.
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ method, path, query, body, confirm }): Promise<ToolResult> => {
+      try {
+        const mode = resolvePassthroughMode(process.env.CLOUDFLARE_API_PASSTHROUGH);
+        if (mode === "off") {
+          throw new CloudflareApiError(
+            "The Cloudflare API passthrough is disabled (CLOUDFLARE_API_PASSTHROUGH=off). Set CLOUDFLARE_API_PASSTHROUGH=read " +
+              "(GET/HEAD only) or =full (also POST/PUT/PATCH/DELETE, each requiring confirm=true) in the server's environment, " +
+              "or unset it for the reads-on default. For DNS work, prefer the typed cloudflare_* tools.",
+          );
+        }
+
+        // One normalized method value, used for BOTH the write-gate decision and dispatch — the zod
+        // enum already fixes exact case, so no toUpperCase step exists that could let them diverge.
+        const httpMethod: string = method;
+        const mutating = MUTATING_METHODS.has(httpMethod);
+
+        if (mutating) {
+          if (mode !== "full") {
+            throw new CloudflareApiError(
+              `${httpMethod} is a mutating request, but CLOUDFLARE_API_PASSTHROUGH is 'read' — only GET/HEAD are allowed. ` +
+                "Set CLOUDFLARE_API_PASSTHROUGH=full in the server's environment to permit writes, then retry with confirm=true.",
+            );
+          }
+          if (confirm !== true) {
+            throw new CloudflareApiError(
+              `${httpMethod} ${path} would modify the live Cloudflare account, which is not confirmed. Re-call with ` +
+                "confirm=true after verifying the method, path, and body. Writes can be irreversible (e.g. deleting a zone).",
+            );
+          }
+        }
+
+        // Host-pin the path BEFORE any network call. (doFetch re-validates as the single URL
+        // construction site, but gating here keeps the refusal explicit and network-free.)
+        validateApiPath(path);
+
+        const res = await cfApiPassthrough(httpMethod, path, { query, body });
+        const header = `${httpMethod} ${path} → HTTP ${res.status}`;
+        if (res.json !== undefined) {
+          return ok(
+            `${header}\n${JSON.stringify(res.json, null, 2)}`,
+            { status: res.status, ok: res.ok, response: res.json },
+            "narrow the endpoint or add query filters/pagination to reduce the response size",
+          );
+        }
+        if (res.nonJson) {
+          return ok(
+            `${header} (non-JSON body)\n${res.text ?? ""}`,
+            { status: res.status, ok: res.ok, body: res.text ?? "" },
+            "the non-JSON response body was truncated",
+          );
+        }
+        return ok(`${header} (${res.ok ? "success" : "failure"}, no response body)`, { status: res.status, ok: res.ok });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
 }
 
-export const TOOL_COUNT = 8;
+export const TOOL_COUNT = 9;
