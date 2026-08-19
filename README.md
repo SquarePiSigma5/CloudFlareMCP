@@ -1,6 +1,8 @@
 # cloudflare-dns-mcp-server
 
-A Model Context Protocol (MCP) server that lets any MCP-compatible LLM client (Claude Code, Claude Desktop, claude.ai custom connectors, Cursor, and others) read and edit DNS records on your Cloudflare account. It runs as a streamable HTTP server (stateless JSON mode, the current MCP standard for remote servers), with an stdio mode for clients that launch local subprocess servers.
+A Model Context Protocol (MCP) server for the **Cloudflare API**. It gives any MCP-compatible LLM client (Claude Code, Claude Desktop, claude.ai custom connectors, ChatGPT connectors, Cursor, and others) eight typed convenience tools for common DNS operations, **plus** `cloudflare_api_request` — a guarded passthrough that can reach any Cloudflare v4 API endpoint the token is scoped for. What the server can actually do is set entirely by the API token's scope: a DNS-scoped token keeps it to DNS, while a broader token unlocks more of the v4 surface (reads by default, writes behind an explicit opt-in). It does not add anything outside Cloudflare's own API.
+
+Connect over **stdio** (for clients that launch a local subprocess) or over **streamable HTTP** in stateless JSON mode (the current MCP standard for remote servers). See [Connecting MCP clients](#connecting-mcp-clients).
 
 ## Tools
 
@@ -20,7 +22,7 @@ A Model Context Protocol (MCP) server that lets any MCP-compatible LLM client (C
 
 Requires Node.js 20+.
 
-**1. Create a scoped Cloudflare API token.** In the Cloudflare dashboard go to My Profile → API Tokens → Create Token → use the **Edit zone DNS** template, and under Zone Resources limit it to the specific zone(s) you want the model to manage. Do not use the Global API Key — a scoped token means the worst-case blast radius is DNS on those zones only.
+**1. Create a scoped Cloudflare API token.** The token is the real security boundary — what the server can do is exactly what the token is scoped for. For DNS work, in the Cloudflare dashboard go to My Profile → API Tokens → Create Token → use the **Edit zone DNS** template, and under Zone Resources limit it to the specific zone(s) you want the model to manage. Do not use the Global API Key. Grant only the permissions the task needs: a DNS-scoped token means the worst-case blast radius is DNS on those zones, even though `cloudflare_api_request` can reach any endpoint the token permits (see [Beyond DNS](#beyond-dns-raw-api-passthrough)).
 
 **2. Install and build:**
 
@@ -33,7 +35,7 @@ npm run build
 
 ```bash
 cp .env.example .env   # fill in tokens, then either export them or use a loader
-export CLOUDFLARE_API_TOKEN="cf_..."
+export CLOUDFLARE_API_TOKEN="cfat_..."
 export MCP_AUTH_TOKEN="$(openssl rand -hex 24)"   # protects the MCP endpoint itself
 npm start
 ```
@@ -48,41 +50,61 @@ MCP_AUTH_TOKEN="<same token>" npm run smoke
 
 This connects with a real MCP client, lists the 9 tools, and calls `cloudflare_verify_token`. You can also point MCP Inspector at the URL: `npx @modelcontextprotocol/inspector`.
 
-## Connecting clients
+## Connecting MCP clients
 
-**Claude Code:**
+The server speaks the two standard MCP transports; pick by how your client connects. A client that **launches a local subprocess** uses stdio. A client that **connects to a URL** uses HTTP. The same nine tools are exposed either way.
 
-```bash
-claude mcp add --transport http cloudflare-dns http://127.0.0.1:8787/mcp \
-  --header "Authorization: Bearer $MCP_AUTH_TOKEN"
-```
+### Local (stdio)
 
-**Cursor / other clients with JSON config** — any client that supports streamable HTTP with custom headers works the same way:
+For clients that launch a local subprocess server — Claude Desktop, Cursor, Cline, and similar. The client runs `dist/index.js` with `TRANSPORT=stdio` and passes the Cloudflare token in its own `env` block. There is no network surface, so **no `MCP_AUTH_TOKEN` is needed**.
 
 ```json
 {
   "mcpServers": {
-    "cloudflare-dns": {
-      "url": "http://127.0.0.1:8787/mcp",
+    "cloudflare": {
+      "command": "node",
+      "args": ["/absolute/path/to/cloudflare-dns-mcp-server/dist/index.js"],
+      "env": {
+        "CLOUDFLARE_API_TOKEN": "cfat_...",
+        "TRANSPORT": "stdio",
+        "CLOUDFLARE_API_PASSTHROUGH": "read"
+      }
+    }
+  }
+}
+```
+
+The token can live in this `env` block or in the shell that launches the client. After `npm install -g .`, the `cloudflare-dns-mcp-server` bin is on your `PATH`, so you can set `"command": "cloudflare-dns-mcp-server"` (dropping `args`) instead of `node` plus the absolute path.
+
+### Remote (HTTP)
+
+For clients that connect to a URL — ChatGPT custom connectors / MCP, Claude Code, claude.ai custom connectors, and any streamable-HTTP client.
+
+1. **Run the server** (`npm start`, or [Docker](#running-with-docker)) and set `MCP_AUTH_TOKEN` so the `/mcp` endpoint requires a bearer token.
+2. **Put it behind HTTPS** — a reverse proxy, your platform's TLS, or a Cloudflare Tunnel (`cloudflared tunnel --url http://127.0.0.1:8787`). Remote clients can't reach `localhost`.
+3. **Add it in the client** as a custom MCP server / connector pointing at `https://<host>/mcp` with header `Authorization: Bearer <MCP_AUTH_TOKEN>`.
+
+Claude Code:
+
+```bash
+claude mcp add --transport http cloudflare https://<host>/mcp \
+  --header "Authorization: Bearer $MCP_AUTH_TOKEN"
+```
+
+Generic JSON config (any streamable-HTTP client that supports custom headers):
+
+```json
+{
+  "mcpServers": {
+    "cloudflare": {
+      "url": "https://<host>/mcp",
       "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" }
     }
   }
 }
 ```
 
-**Clients that only launch local stdio servers:**
-
-```json
-{
-  "mcpServers": {
-    "cloudflare-dns": {
-      "command": "node",
-      "args": ["/path/to/cloudflare-dns-mcp-server/dist/index.js"],
-      "env": { "CLOUDFLARE_API_TOKEN": "cf_...", "TRANSPORT": "stdio" }
-    }
-  }
-}
-```
+**ChatGPT** connects to remote MCP servers by URL — add it under its connectors / MCP settings (typically requires developer mode). It needs a public HTTPS URL. As with the claude.ai connector UI, exact auth-field support (a static bearer header vs OAuth) varies by client version, so check the client's current MCP docs. If the client can't send a static `Authorization` header, terminate auth upstream instead (e.g. Cloudflare Access) — as described in the next paragraph.
 
 **claude.ai / Claude mobile custom connectors** need a public HTTPS URL — they can't reach `localhost`. The quickest path is a Cloudflare Tunnel from the machine running the server:
 
@@ -90,7 +112,29 @@ claude mcp add --transport http cloudflare-dns http://127.0.0.1:8787/mcp \
 cloudflared tunnel --url http://127.0.0.1:8787
 ```
 
-Important caveat: the claude.ai custom-connector UI authenticates via OAuth or not at all — it has no field for a static bearer header. That leaves two options for remote use: put the tunnel behind Cloudflare Access (service auth) and terminate auth there, or run with `MCP_AUTH_TOKEN` unset and rely on the tunnel URL staying secret — which is meaningfully weaker protection for something that can edit your DNS. With a Cloudflare Tunnel the server still binds `127.0.0.1`, so no opt-in is needed; but if you expose the port directly instead of tunnelling, an unauthenticated non-localhost bind requires `ALLOW_UNAUTHENTICATED=true`. Check the current claude.ai connector auth options before choosing; this changes over time.
+Important caveat: the claude.ai custom-connector UI authenticates via OAuth or not at all — it has no field for a static bearer header. That leaves two options for remote use: put the tunnel behind Cloudflare Access (service auth) and terminate auth there, or run with `MCP_AUTH_TOKEN` unset and rely on the tunnel URL staying secret — which is meaningfully weaker protection for something that can change your Cloudflare account. With a Cloudflare Tunnel the server still binds `127.0.0.1`, so no opt-in is needed; but if you expose the port directly instead of tunnelling, an unauthenticated non-localhost bind requires `ALLOW_UNAUTHENTICATED=true`. Check the current connector auth options before choosing; this changes over time.
+
+## Running with Docker
+
+The image is self-contained and stateless, and **no secret is ever built into it** — tokens are passed at run time. Because a container must bind `0.0.0.0` to be reachable through a published port, `MCP_AUTH_TOKEN` is **required**: the server fails closed without it (unless `ALLOW_UNAUTHENTICATED=true`, for when auth is terminated upstream). This is the correct behavior for a network-exposed server.
+
+```bash
+docker build -t cloudflare-mcp .
+
+docker run --rm -p 8787:8787 \
+  -e CLOUDFLARE_API_TOKEN=cfat_... \
+  -e MCP_AUTH_TOKEN="$(openssl rand -hex 24)" \
+  cloudflare-mcp
+# add -e CLOUDFLARE_API_PASSTHROUGH=full to also allow passthrough writes (see Beyond DNS)
+```
+
+Or with Compose, which reads secrets from a gitignored `.env` you create (copy `.env.example`) or from your shell — never from the compose file:
+
+```bash
+docker compose up --build
+```
+
+Either way the endpoint is at `http://<host>:8787/mcp` (health check at `/healthz`). Put HTTPS in front of the published port and add it to a client per [Remote (HTTP)](#remote-http) above.
 
 ## Security notes
 

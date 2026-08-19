@@ -1,0 +1,40 @@
+# Keep the build context minimal and secret-free. The Dockerfile only copies
+# package.json, package-lock.json, tsconfig.json and src/ — everything else is noise.
+
+# Dependencies and build output are regenerated inside the image.
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets / local env — MUST never enter the build context.
+.env
+.env.*
+# (.env.example is matched by .env.* above and is intentionally excluded too —
+#  the image does not need it.)
+
+# Version control and CI metadata
+.git/
+.gitignore
+.github/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Docker files themselves (not needed inside the image)
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Docs (not needed at runtime)
+README.md
+LICENSE
+
+# Tests / smoke scripts (not copied into the image; tsconfig excludes them from the build)
+scripts/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
