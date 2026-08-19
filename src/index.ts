@@ -27,7 +27,10 @@ const INSTRUCTIONS =
   "Tools for managing DNS records on the connected Cloudflare account. " +
   "Zones can be referenced by domain name or zone ID. Record edits require the record's ID — " +
   "always call cloudflare_list_dns_records first to find it. TTL of 1 means 'Auto'. " +
-  "Consider cloudflare_export_zone as a backup before bulk or risky changes.";
+  "Consider cloudflare_export_zone as a backup before bulk or risky changes. " +
+  "cloudflare_api_request makes raw Cloudflare v4 API calls to any endpoint the token can reach (not just DNS): " +
+  "reads (GET/HEAD) are available by default, while mutating methods require CLOUDFLARE_API_PASSTHROUGH=full plus " +
+  "confirm=true (CLOUDFLARE_API_PASSTHROUGH=off disables it entirely) — prefer the typed cloudflare_* tools whenever they fit.";
 
 function buildServer(): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });

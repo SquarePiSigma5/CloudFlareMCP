@@ -4,6 +4,11 @@
  */
 
 const API_BASE = "https://api.cloudflare.com/client/v4";
+const API_BASE_URL = new URL(API_BASE);
+/** Fixed origin every request is pinned to. */
+const API_ORIGIN = API_BASE_URL.origin; // "https://api.cloudflare.com"
+/** Every request pathname must live under this prefix (note the trailing slash). */
+const API_PATH_PREFIX = `${API_BASE_URL.pathname}/`; // "/client/v4/"
 
 /** Truncate any single tool response body beyond this many characters. */
 export const CHARACTER_LIMIT = 25_000;
@@ -92,8 +97,66 @@ interface RequestOptions {
   body?: unknown;
 }
 
+/**
+ * Validate a caller-supplied, RELATIVE Cloudflare v4 API path and return the pinned request URL.
+ *
+ * This is the single source of truth for how a path becomes a URL — doFetch() calls it too, so the
+ * URL that is actually fetched is exactly the one that was validated (there is no second,
+ * drift-prone construction that a future refactor could let diverge from the check).
+ *
+ * Host pinning holds because the origin is fixed by the literal API_BASE prefix BEFORE new URL()
+ * ever parses the caller's path: the URL is always built with `new URL(`${API_BASE}${path}`)` by
+ * string concatenation, NEVER the two-argument `new URL(path, API_BASE)` form — in that form an
+ * absolute URL in `path` (e.g. "https://evil.example/x") would replace the base entirely and send
+ * the Cloudflare bearer token to another host. The origin/pathname assertions below are a
+ * defense-in-depth backstop against that invariant being broken later; they are NOT a redirect
+ * safeguard (a cross-origin redirect from Cloudflare's own server is out of scope, and fetch drops
+ * credentials across origins regardless).
+ */
+export function validateApiPath(path: string): URL {
+  if (typeof path !== "string" || path.length === 0) {
+    throw new CloudflareApiError("API path is required, e.g. '/zones' or '/zones/{zone_id}/purge_cache'.");
+  }
+  if (!path.startsWith("/")) {
+    throw new CloudflareApiError(
+      `API path must be relative to the Cloudflare v4 base and begin with '/' (got ${JSON.stringify(path)}). ` +
+        "Pass a path like '/zones' — not a full URL, host, or scheme.",
+    );
+  }
+  if (path.startsWith("//")) {
+    throw new CloudflareApiError(
+      `API path must not begin with '//' (got ${JSON.stringify(path)}) — a protocol-relative path could target another host.`,
+    );
+  }
+  if (path.includes("\\")) {
+    throw new CloudflareApiError(`API path must not contain a backslash (got ${JSON.stringify(path)}).`);
+  }
+  if (/[\s\u0000-\u001f\u007f]/.test(path)) {
+    throw new CloudflareApiError("API path must not contain whitespace or control characters.");
+  }
+  // Any '..' segment can walk out of /client/v4; reject up front (the pathname check below is the backstop).
+  if (path.split(/[/?#]/).includes("..")) {
+    throw new CloudflareApiError(`API path must not contain '..' path traversal (got ${JSON.stringify(path)}).`);
+  }
+  let url: URL;
+  try {
+    // String concatenation only — see the doc comment above for why the two-arg form is unsafe.
+    url = new URL(`${API_BASE}${path}`);
+  } catch {
+    throw new CloudflareApiError(`API path is not a valid URL path (got ${JSON.stringify(path)}).`);
+  }
+  if (url.origin !== API_ORIGIN || !url.pathname.startsWith(API_PATH_PREFIX)) {
+    throw new CloudflareApiError(
+      `API path must resolve under ${API_ORIGIN}${API_PATH_PREFIX} (got ${JSON.stringify(path)}). ` +
+        "Absolute URLs, other hosts, userinfo, and paths that escape the v4 base are refused.",
+    );
+  }
+  return url;
+}
+
 async function doFetch(method: string, path: string, opts: RequestOptions): Promise<Response> {
-  const url = new URL(`${API_BASE}${path}`);
+  // Single, pinned URL construction (host-pinning + SSRF guard) shared with the passthrough validator.
+  const url = validateApiPath(path);
   for (const [k, v] of Object.entries(opts.query ?? {})) {
     if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
   }
@@ -196,6 +259,76 @@ export async function cfRequestText(method: string, path: string): Promise<strin
     }
   }
   return text;
+}
+
+/** Outcome of a guarded raw passthrough request. Exactly one body field is set on success. */
+export interface PassthroughResponse {
+  status: number;
+  ok: boolean;
+  /** Parsed JSON body, when the response was JSON. */
+  json?: unknown;
+  /** Raw text body, when the response was a successful non-JSON payload (e.g. a BIND export). */
+  text?: string;
+  /** True when the body was returned as raw text rather than parsed JSON. */
+  nonJson?: boolean;
+}
+
+/**
+ * Guarded raw request for the cloudflare_api_request passthrough tool.
+ *
+ * It reuses doFetch (so the Authorization header is still added centrally — the token never leaks
+ * here — and the path is host-pinned by validateApiPath) and statusHint (so error rendering matches
+ * the DNS tools). Unlike cfRequest it does NOT assume the standard {success, result} envelope: the
+ * wider v4 API returns bare JSON, non-JSON text (BIND exports, PEM, Worker source), and empty bodies
+ * (HEAD), so a successful non-JSON 200 must not be misreported as a "proxy is intercepting" failure.
+ * HEAD is handled without reading a body at all (which is exactly why it cannot reuse cfRequest,
+ * whose unconditional res.json() throws on the empty body every HEAD returns).
+ */
+export async function cfApiPassthrough(method: string, path: string, opts: RequestOptions = {}): Promise<PassthroughResponse> {
+  const res = await doFetch(method, path, opts);
+
+  if (method === "HEAD") {
+    // HEAD has no body by definition — report the HTTP outcome, never parse a body.
+    if (!res.ok) {
+      throw new CloudflareApiError(`Cloudflare API error (HTTP ${res.status}).${statusHint(res.status, [])}`, res.status);
+    }
+    return { status: res.status, ok: res.ok };
+  }
+
+  let bodyText: string;
+  try {
+    bodyText = await res.text();
+  } catch (err) {
+    if (isAbortError(err)) throw bodyReadTimeoutError();
+    throw err;
+  }
+
+  const contentType = res.headers.get("content-type") ?? "";
+  const looksJson = /\bjson\b/i.test(contentType) || /^\s*[[{]/.test(bodyText);
+
+  if (bodyText.trim().length > 0 && looksJson) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bodyText);
+    } catch {
+      throw new CloudflareApiError(`Cloudflare returned a malformed JSON response (HTTP ${res.status}).`, res.status);
+    }
+    // Surface the standard envelope's errors when present; otherwise return the JSON as-is.
+    const env = parsed as { success?: boolean; errors?: CfError[] };
+    if (!res.ok || env.success === false) {
+      const errors = env.errors ?? [];
+      const details = errors.map((e) => `[${e.code}] ${e.message}`).join("; ") || `HTTP ${res.status}`;
+      throw new CloudflareApiError(`Cloudflare API error: ${details}.${statusHint(res.status, errors)}`, res.status, errors);
+    }
+    return { status: res.status, ok: res.ok, json: parsed };
+  }
+
+  // Non-JSON (or empty) body.
+  if (!res.ok) {
+    const detail = bodyText ? `: ${bodyText.slice(0, 300)}` : "";
+    throw new CloudflareApiError(`Cloudflare API error (HTTP ${res.status})${detail}.${statusHint(res.status, [])}`, res.status);
+  }
+  return { status: res.status, ok: res.ok, text: bodyText, nonJson: true };
 }
 
 const ZONE_ID_RE = /^[0-9a-f]{32}$/;

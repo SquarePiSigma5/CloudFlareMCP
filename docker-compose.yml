@@ -1,0 +1,41 @@
+# docker-compose.yml — build and run the Cloudflare API MCP server.
+#
+# Secrets are NEVER stored in this file. They are supplied at run time from EITHER:
+#   (a) a gitignored .env file you create (copy .env.example -> .env), OR
+#   (b) your shell environment (which overrides .env when both set a variable).
+# See .env.example for the full list of variables.
+#
+#   docker compose up --build
+
+services:
+  cloudflare-mcp:
+    build: .
+    image: cloudflare-mcp
+    # Publish the MCP endpoint on the host. Change the LEFT number to remap the
+    # host port (e.g. "9000:8787"); the container always listens on 8787.
+    ports:
+      - "8787:8787"
+    # Optional, user-supplied env file (gitignored). Injects CLOUDFLARE_API_TOKEN,
+    # MCP_AUTH_TOKEN, CLOUDFLARE_API_PASSTHROUGH, etc. into the container.
+    # required:false lets `docker compose up` run even with no .env — pass the
+    # variables through your shell instead. (Needs Docker Compose v2.24+.)
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Non-secret operational config, set explicitly here.
+      # HOST=0.0.0.0 is REQUIRED inside a container so the server is reachable
+      # through the published port. Binding a non-loopback address makes the
+      # server REQUIRE MCP_AUTH_TOKEN (or ALLOW_UNAUTHENTICATED=true) — supply
+      # MCP_AUTH_TOKEN via .env or your shell, or the container exits by design.
+      - HOST=0.0.0.0
+      - PORT=8787
+      # Secrets / knobs: bare names (no "=value") pass through from your shell if
+      # set, otherwise fall back to the value in .env above. Nothing sensitive is
+      # written into this file.
+      - CLOUDFLARE_API_TOKEN
+      - MCP_AUTH_TOKEN
+      - CLOUDFLARE_API_PASSTHROUGH
+      - ALLOW_UNAUTHENTICATED
+      - ALLOWED_ORIGINS
+    restart: unless-stopped
