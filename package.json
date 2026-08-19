@@ -1,7 +1,7 @@
 {
   "name": "cloudflare-dns-mcp-server",
   "version": "1.0.0",
-  "description": "MCP server (streamable HTTP) for managing Cloudflare DNS records from any MCP-compatible LLM client",
+  "description": "MCP server for the Cloudflare API — typed DNS convenience tools plus a guarded passthrough to any v4 endpoint the token is scoped for; usable from any MCP client over stdio or streamable HTTP",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
@@ -11,7 +11,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node --test scripts/guard-test.mjs"
   },
   "engines": {
     "node": ">=20"
