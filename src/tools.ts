@@ -126,7 +126,9 @@ export function registerTools(server: McpServer): void {
       title: "Verify Cloudflare API Token",
       description: `Verify that the server's Cloudflare API token is valid and active.
 
-Returns the token's ID and status ('active' if usable). Call this first if other tools are failing with auth errors. It does not reveal the token value itself.`,
+Returns the token's ID and status ('active' if usable). Call this first if other tools are failing with auth errors. It does not reveal the token value itself.
+
+Note: the /user/tokens/verify endpoint is user-scoped, so an account-scoped token can be rejected there (HTTP 401/403) even though it works fine for DNS. If that happens, this tool falls back to probing the Zones API and reports the token as valid when the probe succeeds.`,
       inputSchema: {},
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -143,6 +145,36 @@ Returns the token's ID and status ('active' if usable). Call this first if other
           structured,
         );
       } catch (err) {
+        // /user/tokens/verify is USER-scoped: an account-scoped token that is perfectly valid for
+        // /zones and DNS can be rejected there with 401/403. On a 401/403, fall back to a Zones probe
+        // before declaring the token invalid — a false negative on the first tool a user runs is
+        // exactly the defect we're avoiding. Errors without a 401/403 status (network error, timeout,
+        // or a non-JSON body that arrived without one) skip the probe and fail directly. A non-JSON
+        // body that *does* carry 401/403 (e.g. an intercepting proxy) still probes harmlessly: the
+        // probe hits the same failure and the original verify error is surfaced below.
+        if (err instanceof CloudflareApiError && (err.status === 401 || err.status === 403)) {
+          try {
+            const { result_info } = await cfRequest<Zone[]>("GET", "/zones", { query: { per_page: 1 } });
+            const total = result_info?.total_count;
+            return ok(
+              `This token could not use /user/tokens/verify (HTTP ${err.status}), which is normal for ` +
+                "account-scoped tokens — but it IS valid: it can reach the Zones API" +
+                (total !== undefined ? ` (${total} zone(s) visible)` : "") +
+                ". Use cloudflare_list_zones to see what it can manage.",
+              {
+                usable: true,
+                verified_via: "zones_probe",
+                verify_status: err.status,
+                ...(total !== undefined ? { zones_total: total } : {}),
+              },
+            );
+          } catch {
+            // The probe also failed: the token is genuinely invalid or too narrowly scoped to do
+            // anything useful. Surface the ORIGINAL verify error (the real auth failure), not the
+            // probe error.
+            return fail(err);
+          }
+        }
         return fail(err);
       }
     },
