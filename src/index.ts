@@ -53,7 +53,9 @@ function originAllowed(origin: string): boolean {
     .filter(Boolean);
   if (extra.includes(origin)) return true;
   try {
-    const host = new URL(origin).hostname;
+    let host = new URL(origin).hostname;
+    // WHATWG URL keeps IPv6 literals bracketed (e.g. '[::1]'); strip them before comparing.
+    if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
     return host === "localhost" || host === "127.0.0.1" || host === "::1";
   } catch {
     return false;
@@ -62,7 +64,6 @@ function originAllowed(origin: string): boolean {
 
 async function runHttp(): Promise<void> {
   const app = express();
-  app.use(express.json({ limit: "1mb" }));
 
   const authToken = process.env.MCP_AUTH_TOKEN;
 
@@ -89,7 +90,9 @@ async function runHttp(): Promise<void> {
   });
 
   // Stateless: fresh server + transport per request (no sessions, plain JSON responses).
-  app.post("/mcp", async (req, res) => {
+  // Body parsing is attached here (not globally) so the /mcp auth+origin middleware above
+  // runs FIRST — a malformed JSON POST from an unauthenticated client is rejected before parsing.
+  app.post("/mcp", express.json({ limit: "1mb" }), async (req, res) => {
     try {
       const server = buildServer();
       const transport = new StreamableHTTPServerTransport({
@@ -118,10 +121,30 @@ async function runHttp(): Promise<void> {
   app.get("/mcp", methodNotAllowed);
   app.delete("/mcp", methodNotAllowed);
 
+  // Final error handler: never leaks stack traces (regardless of NODE_ENV). Body-parse and other
+  // client (4xx) errors get a minimal JSON reply; anything else is logged (message only) as a 500.
+  app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction): void => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const e = err as { type?: string; status?: number; statusCode?: number };
+    const status = e.status ?? e.statusCode;
+    if (e.type === "entity.parse.failed" || (typeof status === "number" && status >= 400 && status < 500)) {
+      res.status(typeof status === "number" ? status : 400).json({ error: "Bad request: malformed or unacceptable request body" });
+      return;
+    }
+    log("request error:", err instanceof Error ? err.message : String(err));
+    res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
+  });
+
   const host = process.env.HOST ?? "127.0.0.1";
   const port = Number.parseInt(process.env.PORT ?? "8787", 10);
 
-  if (!authToken && host !== "127.0.0.1" && host !== "localhost") {
+  // Normalize only for the warning decision — app.listen still gets the user's original HOST.
+  const normalizedHost = host.trim().toLowerCase();
+  const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+  if (!authToken && !LOOPBACK_HOSTS.has(normalizedHost)) {
     log(
       "WARNING: server is binding to a non-localhost address without MCP_AUTH_TOKEN set. " +
         "Anyone who can reach this port can edit your DNS. Set MCP_AUTH_TOKEN before exposing it.",
