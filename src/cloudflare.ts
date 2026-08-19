@@ -201,12 +201,17 @@ export async function cfRequestText(method: string, path: string): Promise<strin
 const ZONE_ID_RE = /^[0-9a-f]{32}$/;
 const zoneCache = new Map<string, Zone>();
 
+/** Normalize a zone reference (name or ID) into its cache key: trimmed, lowercased, no trailing dot. */
+function normalizeZoneKey(zone: string): string {
+  return zone.trim().toLowerCase().replace(/\.$/, "");
+}
+
 /**
  * Resolve a zone given either its domain name ("example.com") or its 32-char zone ID.
  * Caches results for the lifetime of the process.
  */
 export async function resolveZone(zone: string): Promise<Zone> {
-  const key = zone.trim().toLowerCase().replace(/\.$/, "");
+  const key = normalizeZoneKey(zone);
   if (!key) {
     throw new CloudflareApiError("Empty zone. Pass a domain name (e.g. 'example.com') or a 32-character zone ID.");
   }
@@ -233,6 +238,38 @@ export async function resolveZone(zone: string): Promise<Zone> {
   zoneCache.set(found.id, found);
   zoneCache.set(found.name.toLowerCase(), found);
   return found;
+}
+
+/**
+ * Run `fn` against a resolved zone, recovering transparently from a stale zone cache.
+ *
+ * zoneCache lives for the whole process, so a zone that was deleted and re-created under a
+ * new ID would otherwise keep resolving to the dead cached ID forever. When `fn` fails with a
+ * 404 on a zone we served from cache, that cached ID is the prime suspect: evict it, re-resolve
+ * the reference fresh, and — only if the zone truly moved to a new ID — retry `fn` once against
+ * the new zone. A 404 whose re-resolved ID is unchanged is about the record, not the zone, so
+ * the original error is rethrown without re-running `fn`.
+ */
+export async function withZone<T>(zoneRef: string, fn: (zone: Zone) => Promise<T>): Promise<T> {
+  const key = normalizeZoneKey(zoneRef);
+  const wasCached = zoneCache.has(key);
+  const zone = await resolveZone(zoneRef);
+  try {
+    return await fn(zone);
+  } catch (err) {
+    if (err instanceof CloudflareApiError && err.status === 404 && wasCached) {
+      zoneCache.delete(zone.id);
+      zoneCache.delete(zone.name.toLowerCase());
+      const fresh = await resolveZone(zoneRef);
+      if (fresh.id === zone.id) {
+        // Zone is unchanged — the 404 was about the record, not the cached zone. Rethrow as-is.
+        throw err;
+      }
+      // Zone was re-created under a new ID; retry once (a second failure propagates).
+      return await fn(fresh);
+    }
+    throw err;
+  }
 }
 
 export function slimRecord(r: DnsRecord): SlimRecord {
