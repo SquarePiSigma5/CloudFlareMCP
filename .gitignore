@@ -1,3 +1,20 @@
 node_modules/
 dist/
+
+# Environment files — never commit tokens
 .env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build metadata
+*.tsbuildinfo
