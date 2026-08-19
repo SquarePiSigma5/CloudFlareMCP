@@ -116,6 +116,24 @@ async function doFetch(method: string, path: string, opts: RequestOptions): Prom
   }
 }
 
+/** True when an error (or its cause) is an abort/timeout from the request's AbortSignal. */
+function isAbortError(err: unknown): boolean {
+  if (err instanceof Error) {
+    if (err.name === "AbortError" || err.name === "TimeoutError") return true;
+    const cause = (err as { cause?: unknown }).cause;
+    if (cause instanceof Error && (cause.name === "AbortError" || cause.name === "TimeoutError")) return true;
+  }
+  return false;
+}
+
+/** CloudflareApiError for an abort/timeout that fired while the response body was being read. */
+function bodyReadTimeoutError(): CloudflareApiError {
+  return new CloudflareApiError(
+    "Network error reaching the Cloudflare API (the request timed out while reading the response body). " +
+      "Check the machine running this MCP server has outbound HTTPS access to api.cloudflare.com, then retry.",
+  );
+}
+
 function statusHint(status: number, errors: CfError[]): string {
   const codes = errors.map((e) => e.code);
   if (status === 401 || codes.includes(10000)) {
@@ -139,7 +157,8 @@ export async function cfRequest<T>(method: string, path: string, opts: RequestOp
   let payload: CfEnvelope<T>;
   try {
     payload = (await res.json()) as CfEnvelope<T>;
-  } catch {
+  } catch (err) {
+    if (isAbortError(err)) throw bodyReadTimeoutError();
     throw new CloudflareApiError(
       `Cloudflare returned a non-JSON response (HTTP ${res.status}). ` +
         "A proxy or firewall between this server and api.cloudflare.com may be intercepting the request.",
@@ -157,7 +176,13 @@ export async function cfRequest<T>(method: string, path: string, opts: RequestOp
 /** Plain-text request (used for the BIND zone-file export endpoint). */
 export async function cfRequestText(method: string, path: string): Promise<string> {
   const res = await doFetch(method, path, {});
-  const text = await res.text();
+  let text: string;
+  try {
+    text = await res.text();
+  } catch (err) {
+    if (isAbortError(err)) throw bodyReadTimeoutError();
+    throw err;
+  }
   if (!res.ok) {
     // Export errors still come back as the JSON envelope.
     try {
@@ -238,10 +263,7 @@ export function formatRecordLine(r: SlimRecord): string {
   return `- ${r.type} ${r.name} → ${content} (${flags.join(", ")}) [id: ${r.id}]${comment}`;
 }
 
-export function truncate(text: string): string {
+export function truncate(text: string, hint = "use filters (type/name) or pagination to narrow the result"): string {
   if (text.length <= CHARACTER_LIMIT) return text;
-  return (
-    text.slice(0, CHARACTER_LIMIT) +
-    `\n… [truncated at ${CHARACTER_LIMIT} characters — use filters (type/name) or pagination to narrow the result]`
-  );
+  return text.slice(0, CHARACTER_LIMIT) + `\n… [truncated at ${CHARACTER_LIMIT} characters — ${hint}]`;
 }

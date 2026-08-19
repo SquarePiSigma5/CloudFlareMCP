@@ -27,6 +27,7 @@ const RECORD_TYPES = [
   "MX",
   "NAPTR",
   "NS",
+  "OPENPGPKEY",
   "PTR",
   "SMIMEA",
   "SRV",
@@ -53,9 +54,12 @@ const ttlParam = z
   .number()
   .int()
   .refine((v) => v === 1 || (v >= 30 && v <= 86_400), {
-    message: "TTL must be 1 (meaning 'Auto') or between 30 and 86400 seconds.",
+    message:
+      "TTL must be 1 (meaning 'Auto') or between 30 and 86400 seconds. Note: TTLs of 30–59 are accepted only on Cloudflare Enterprise zones; the floor is 60 seconds on all other plans.",
   })
-  .describe("Time-to-live in seconds. Use 1 for 'Auto' (default). Otherwise 30–86400.");
+  .describe(
+    "Time-to-live in seconds. Use 1 for 'Auto' (default). Otherwise 30–86400 — but TTLs of 30–59 are accepted only on Cloudflare Enterprise zones; the floor is 60 seconds elsewhere.",
+  );
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -63,9 +67,9 @@ type ToolResult = {
   isError?: boolean;
 };
 
-function ok(text: string, structured?: Record<string, unknown>): ToolResult {
+function ok(text: string, structured?: Record<string, unknown>, hint?: string): ToolResult {
   return {
-    content: [{ type: "text", text: truncate(text) }],
+    content: [{ type: "text", text: hint !== undefined ? truncate(text, hint) : truncate(text) }],
     ...(structured ? { structuredContent: structured } : {}),
   };
 }
@@ -77,7 +81,8 @@ function fail(err: unknown): ToolResult {
       : err instanceof Error
         ? `Unexpected error: ${err.message}`
         : `Unexpected error: ${String(err)}`;
-  return { isError: true, content: [{ type: "text", text: `Error: ${message}` }] };
+  // Neutral hint — narrowing filters don't apply to an error message.
+  return { isError: true, content: [{ type: "text", text: truncate(`Error: ${message}`, "the remainder of the error message was omitted") }] };
 }
 
 async function getRecord(zone: Zone, recordId: string): Promise<DnsRecord> {
@@ -268,7 +273,13 @@ Examples:
         ttl: ttlParam.default(1),
         proxied: z.boolean().default(false).describe("Proxy through Cloudflare (A/AAAA/CNAME only)."),
         priority: z.number().int().min(0).max(65_535).optional().describe("Required for MX and URI records."),
-        comment: z.string().max(500).optional().describe("Optional note stored with the record."),
+        comment: z
+          .string()
+          .max(500)
+          .optional()
+          .describe(
+            "Optional note stored with the record. Cloudflare caps comments at 100 characters on Free-plan zones (500 on paid plans).",
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -319,6 +330,8 @@ Args:
   - record_id (string): ID of the record to change (find it with cloudflare_list_dns_records).
   - type, name, content, data, ttl, proxied, priority, comment: any subset of fields to change.
 
+Changing a record's type to MX requires 'priority'; 'proxied' is only valid when the resulting type is A, AAAA, or CNAME.
+
 Returns both the record's state BEFORE and AFTER the change, so the edit can be reverted if needed. Changing live DNS can affect a running website or email — double-check the record ID and new values.`,
       inputSchema: {
         zone: zoneParam,
@@ -330,7 +343,13 @@ Returns both the record's state BEFORE and AFTER the change, so the edit can be 
         ttl: ttlParam.optional(),
         proxied: z.boolean().optional().describe("Toggle Cloudflare proxying (A/AAAA/CNAME only)."),
         priority: z.number().int().min(0).max(65_535).optional().describe("New priority (MX/URI/SRV)."),
-        comment: z.string().max(500).optional().describe("New comment. Pass an empty string to clear it."),
+        comment: z
+          .string()
+          .max(500)
+          .optional()
+          .describe(
+            "New comment. Pass an empty string to clear it. Cloudflare caps comments at 100 characters on Free-plan zones (500 on paid plans).",
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
@@ -350,6 +369,13 @@ Returns both the record's state BEFORE and AFTER the change, so the edit can be 
         }
         const zn = await resolveZone(zone);
         const before = slimRecord(await getRecord(zn, record_id));
+        const effectiveType = (patch.type as string | undefined) ?? before.type;
+        if (patch.type === "MX" && patch.priority === undefined && before.priority === undefined) {
+          throw new CloudflareApiError("MX records require 'priority' (e.g. 10).");
+        }
+        if (patch.proxied === true && !PROXYABLE_TYPES.has(effectiveType)) {
+          throw new CloudflareApiError(`'proxied' is only valid for A, AAAA, and CNAME records (got type=${effectiveType}). Set proxied=false.`);
+        }
         const { result } = await cfRequest<DnsRecord>("PATCH", `/zones/${zn.id}/dns_records/${record_id}`, {
           body: patch,
         });
@@ -416,7 +442,7 @@ Deleting live DNS can take a website or email offline — verify the exact recor
 Args:
   - zone (string): domain name or zone ID.
 
-Returns the zone file as plain text (may be truncated for very large zones).`,
+Returns the zone file as plain text (very large zones may be truncated; a truncated export is marked as incomplete and must not be used as a backup).`,
       inputSchema: { zone: zoneParam },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -424,7 +450,11 @@ Returns the zone file as plain text (may be truncated for very large zones).`,
       try {
         const zn = await resolveZone(zone);
         const text = await cfRequestText("GET", `/zones/${zn.id}/dns_records/export`);
-        return ok(`BIND zone file for ${zn.name}:\n\n${text}`, { zone: { id: zn.id, name: zn.name } });
+        return ok(
+          `BIND zone file for ${zn.name}:\n\n${text}`,
+          { zone: { id: zn.id, name: zn.name } },
+          "this export was cut off and is an INCOMPLETE backup — do NOT restore from it. Export the full zone file from the Cloudflare dashboard (DNS → Records → Export) or the API directly.",
+        );
       } catch (err) {
         return fail(err);
       }
