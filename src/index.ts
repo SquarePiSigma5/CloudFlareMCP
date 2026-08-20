@@ -30,7 +30,12 @@ const INSTRUCTIONS =
   "Consider cloudflare_export_zone as a backup before bulk or risky changes. " +
   "cloudflare_api_request makes raw Cloudflare v4 API calls to any endpoint the token can reach (not just DNS): " +
   "reads (GET/HEAD) are available by default, while mutating methods require CLOUDFLARE_API_PASSTHROUGH=full plus " +
-  "confirm=true (CLOUDFLARE_API_PASSTHROUGH=off disables it entirely) — prefer the typed cloudflare_* tools whenever they fit.";
+  "confirm=true (CLOUDFLARE_API_PASSTHROUGH=off disables it entirely) — prefer the typed cloudflare_* tools whenever they fit. " +
+  "Two Workers tools are off by default and enabled per operator opt-in: cloudflare_set_worker_secret_from_env sets a " +
+  "Worker secret whose value is read from the SERVER's own environment (the model only names an allowlisted env var; the " +
+  "value never passes through the model or output), and cloudflare_deploy_worker uploads/deploys a Worker script. Both " +
+  "require confirm=true; see CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST / CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST and " +
+  "CLOUDFLARE_WORKERS_DEPLOY_ENABLE.";
 
 function buildServer(): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });

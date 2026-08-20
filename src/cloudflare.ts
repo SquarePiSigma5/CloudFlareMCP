@@ -94,7 +94,13 @@ function apiToken(): string {
 
 interface RequestOptions {
   query?: Record<string, string | number | undefined>;
+  /** JSON request body — serialized with an 'application/json' Content-Type. Mutually exclusive with `form`. */
   body?: unknown;
+  /**
+   * Pre-built multipart body (Node 20 global FormData). Passed straight through to fetch WITHOUT a
+   * manual Content-Type so undici sets the multipart boundary itself. Mutually exclusive with `body`.
+   */
+  form?: FormData;
 }
 
 /**
@@ -160,14 +166,28 @@ async function doFetch(method: string, path: string, opts: RequestOptions): Prom
   for (const [k, v] of Object.entries(opts.query ?? {})) {
     if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
   }
+  // ONE place builds the request: URL pinning, the Authorization header, and the timeout live here
+  // for BOTH the JSON path (cfRequest / cfRequestText / cfApiPassthrough) and the multipart path
+  // (cfRequestForm), so a future auth or timeout change can't drift between them. The body is chosen
+  // generically: a pre-built FormData (no manual Content-Type — undici sets the boundary), a JSON
+  // value ('application/json'), or nothing.
+  if (opts.form !== undefined && opts.body !== undefined) {
+    throw new CloudflareApiError("Internal error: a request cannot carry both a JSON body and a multipart form.");
+  }
+  const headers: Record<string, string> = { Authorization: `Bearer ${apiToken()}` };
+  let body: FormData | string | undefined;
+  if (opts.form !== undefined) {
+    // Multipart: never set Content-Type manually — fetch/undici adds it with the required boundary.
+    body = opts.form;
+  } else if (opts.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(opts.body);
+  }
   try {
     return await fetch(url, {
       method,
-      headers: {
-        Authorization: `Bearer ${apiToken()}`,
-        ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
-      },
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      headers,
+      body,
       signal: AbortSignal.timeout(30_000),
     });
   } catch (err) {
@@ -214,9 +234,8 @@ function statusHint(status: number, errors: CfError[]): string {
   return "";
 }
 
-/** JSON request against the Cloudflare v4 API with envelope + error handling. */
-export async function cfRequest<T>(method: string, path: string, opts: RequestOptions = {}): Promise<CfEnvelope<T>> {
-  const res = await doFetch(method, path, opts);
+/** Parse the standard {success, result, errors} envelope from a response, throwing on failure. */
+async function parseJsonEnvelope<T>(res: Response): Promise<CfEnvelope<T>> {
   let payload: CfEnvelope<T>;
   try {
     payload = (await res.json()) as CfEnvelope<T>;
@@ -234,6 +253,25 @@ export async function cfRequest<T>(method: string, path: string, opts: RequestOp
     throw new CloudflareApiError(`Cloudflare API error: ${details}.${statusHint(res.status, errors)}`, res.status, errors);
   }
   return payload;
+}
+
+/** JSON request against the Cloudflare v4 API with envelope + error handling. */
+export async function cfRequest<T>(method: string, path: string, opts: RequestOptions = {}): Promise<CfEnvelope<T>> {
+  const res = await doFetch(method, path, opts);
+  return parseJsonEnvelope<T>(res);
+}
+
+/**
+ * Multipart request against the Cloudflare v4 API (e.g. Worker script uploads).
+ *
+ * Routes through the SAME doFetch as cfRequest, so host-pinning (validateApiPath), the Authorization
+ * header, and the timeout are shared — there is no second, drift-prone construction of the request.
+ * The FormData is passed as-is and its Content-Type (with the multipart boundary) is set by undici,
+ * never by hand. Response parsing reuses parseJsonEnvelope so errors render exactly like the JSON path.
+ */
+export async function cfRequestForm<T>(method: string, path: string, form: FormData): Promise<CfEnvelope<T>> {
+  const res = await doFetch(method, path, { form });
+  return parseJsonEnvelope<T>(res);
 }
 
 /** Plain-text request (used for the BIND zone-file export endpoint). */
@@ -403,6 +441,109 @@ export async function withZone<T>(zoneRef: string, fn: (zone: Zone) => Promise<T
     }
     throw err;
   }
+}
+
+export interface Account {
+  id: string;
+  name: string;
+}
+
+/** Cached, process-lifetime account id resolved from GET /accounts (only when exactly one exists). */
+let resolvedAccountId: string | undefined;
+
+/**
+ * Resolve the account id for account-scoped endpoints (Workers).
+ *
+ * Precedence: an explicit `account_id` argument > CLOUDFLARE_ACCOUNT_ID env > GET /accounts (used only
+ * when the token can see exactly one account). Zero or more-than-one visible accounts throw a clear
+ * error listing the account names and asking for an explicit account_id, rather than guessing. The
+ * single-account lookup is cached for the process so repeated Workers calls don't re-hit /accounts.
+ */
+export async function resolveAccountId(explicit?: string): Promise<string> {
+  const fromParam = explicit?.trim();
+  if (fromParam) return fromParam;
+  const fromEnv = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  if (fromEnv) return fromEnv;
+  if (resolvedAccountId) return resolvedAccountId;
+
+  const { result } = await cfRequest<Account[]>("GET", "/accounts", { query: { per_page: 50 } });
+  if (result.length === 1) {
+    resolvedAccountId = result[0].id;
+    return resolvedAccountId;
+  }
+  if (result.length === 0) {
+    throw new CloudflareApiError(
+      "No Cloudflare account is visible to this API token, so account_id could not be resolved. " +
+        "Pass account_id explicitly, or set CLOUDFLARE_ACCOUNT_ID in the server's environment. " +
+        "The token may also lack the Account → Workers Scripts permission.",
+    );
+  }
+  const names = result.map((a) => `${a.name} (${a.id})`).join(", ");
+  throw new CloudflareApiError(
+    `This API token can see ${result.length} Cloudflare accounts: ${names}. ` +
+      "Pass account_id explicitly (or set CLOUDFLARE_ACCOUNT_ID) to choose which one to act on.",
+  );
+}
+
+/** One part of a multipart Worker upload: its field name, Content-Type, role, and optional filename. */
+export interface WorkerUploadPart {
+  role: "metadata" | "script";
+  /** Multipart field name for this part. For the script part this equals main_module / body_part. */
+  field: string;
+  /** Content-Type (Blob type) for the part. */
+  contentType: string;
+  /** Filename for the part, when one is sent. */
+  filename?: string;
+}
+
+/** The fully-described plan for a multipart Worker upload: the metadata object plus its parts. */
+export interface WorkerUploadPlan {
+  /** JSON object serialized into the "metadata" part. */
+  metadata: Record<string, unknown>;
+  /** Ordered description of every multipart part to send (metadata first, then the script). */
+  parts: WorkerUploadPart[];
+  /** Field name whose part value is the script source (equals main_module for esm, body_part for sw). */
+  scriptField: string;
+}
+
+/**
+ * PURE builder for the multipart Worker-upload metadata and part layout — no I/O, no FormData.
+ *
+ * Verified against Cloudflare's current docs (workers/platform/infrastructure-as-code and
+ * workers/configuration/multipart-upload-metadata):
+ *   - esm:            metadata { main_module, ... }; script part field = main_module, type
+ *                     "application/javascript+module", filename = main_module.
+ *   - service_worker: metadata { body_part, ... };  script part field = body_part,  type
+ *                     "application/javascript".
+ * The metadata part is always the field "metadata" with type "application/json". compatibility_date,
+ * compatibility_flags (when non-empty), and bindings (when non-empty) are included only when provided.
+ */
+export function buildWorkerUploadPlan(input: {
+  mainModule: string;
+  moduleType: "esm" | "service_worker";
+  compatibilityDate?: string;
+  compatibilityFlags?: string[];
+  bindings?: Array<Record<string, unknown>>;
+}): WorkerUploadPlan {
+  const { mainModule, moduleType, compatibilityDate, compatibilityFlags, bindings } = input;
+
+  const metadata: Record<string, unknown> = {};
+  if (moduleType === "esm") {
+    metadata.main_module = mainModule;
+  } else {
+    // service-worker (legacy) syntax: body_part names the script part instead of main_module.
+    metadata.body_part = mainModule;
+  }
+  if (compatibilityDate !== undefined && compatibilityDate !== "") metadata.compatibility_date = compatibilityDate;
+  if (compatibilityFlags !== undefined && compatibilityFlags.length > 0) metadata.compatibility_flags = compatibilityFlags;
+  if (bindings !== undefined && bindings.length > 0) metadata.bindings = bindings;
+
+  const scriptContentType = moduleType === "esm" ? "application/javascript+module" : "application/javascript";
+  const parts: WorkerUploadPart[] = [
+    { role: "metadata", field: "metadata", contentType: "application/json" },
+    { role: "script", field: mainModule, contentType: scriptContentType, filename: mainModule },
+  ];
+  return { metadata, parts, scriptField: mainModule };
 }
 
 export function slimRecord(r: DnsRecord): SlimRecord {

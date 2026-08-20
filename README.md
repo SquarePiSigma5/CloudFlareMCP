@@ -1,6 +1,6 @@
 # cloudflare-dns-mcp-server
 
-A Model Context Protocol (MCP) server for the **Cloudflare API**. It gives any MCP-compatible LLM client (Claude Code, Claude Desktop, claude.ai custom connectors, ChatGPT connectors, Cursor, and others) eight typed convenience tools for common DNS operations, **plus** `cloudflare_api_request` — a guarded passthrough that can reach any Cloudflare v4 API endpoint the token is scoped for. What the server can actually do is set entirely by the API token's scope: a DNS-scoped token keeps it to DNS, while a broader token unlocks more of the v4 surface (reads by default, writes behind an explicit opt-in). It does not add anything outside Cloudflare's own API.
+A Model Context Protocol (MCP) server for the **Cloudflare API**. It gives any MCP-compatible LLM client (Claude Code, Claude Desktop, claude.ai custom connectors, ChatGPT connectors, Cursor, and others) eight typed convenience tools for common DNS operations, **plus** `cloudflare_api_request` — a guarded passthrough that can reach any Cloudflare v4 API endpoint the token is scoped for — **plus** two opt-in Workers tools (`cloudflare_set_worker_secret_from_env`, `cloudflare_deploy_worker`) that are off by default (see [Workers](#workers-secrets-and-deploys)). What the server can actually do is set entirely by the API token's scope: a DNS-scoped token keeps it to DNS, while a broader token unlocks more of the v4 surface (reads by default, writes behind an explicit opt-in). It does not add anything outside Cloudflare's own API.
 
 Connect over **stdio** (for clients that launch a local subprocess) or over **streamable HTTP** in stateless JSON mode (the current MCP standard for remote servers). See [Connecting MCP clients](#connecting-mcp-clients).
 
@@ -17,6 +17,8 @@ Connect over **stdio** (for clients that launch a local subprocess) or over **st
 | `cloudflare_delete_dns_record` | Delete (requires `confirm=true`); returns a snapshot for recreation |
 | `cloudflare_export_zone` | Export the zone as a BIND file — take a backup before bulk changes |
 | `cloudflare_api_request` | Guarded raw passthrough to any Cloudflare v4 endpoint the token can reach (reads on by default — see [Beyond DNS](#beyond-dns-raw-api-passthrough)) |
+| `cloudflare_set_worker_secret_from_env` | Set a Worker secret from the **server's own env** — value never passes through the model (opt-in; see [Workers](#workers-secrets-and-deploys)) |
+| `cloudflare_deploy_worker` | Upload/deploy a Worker script via multipart (opt-in, off by default; see [Workers](#workers-secrets-and-deploys)) |
 
 ## Setup
 
@@ -48,11 +50,11 @@ The MCP endpoint is now at `http://127.0.0.1:8787/mcp` (health check at `/health
 MCP_AUTH_TOKEN="<same token>" npm run smoke
 ```
 
-This connects with a real MCP client, lists the 9 tools, and calls `cloudflare_verify_token`. You can also point MCP Inspector at the URL: `npx @modelcontextprotocol/inspector`.
+This connects with a real MCP client, lists the 11 tools, and calls `cloudflare_verify_token`. You can also point MCP Inspector at the URL: `npx @modelcontextprotocol/inspector`.
 
 ## Connecting MCP clients
 
-The server speaks the two standard MCP transports; pick by how your client connects. A client that **launches a local subprocess** uses stdio. A client that **connects to a URL** uses HTTP. The same nine tools are exposed either way.
+The server speaks the two standard MCP transports; pick by how your client connects. A client that **launches a local subprocess** uses stdio. A client that **connects to a URL** uses HTTP. The same eleven tools are exposed either way.
 
 ### Local (stdio)
 
@@ -167,12 +169,48 @@ Read this first — and especially before setting `full`:
 
 The passthrough never returns or logs the token; host pinning restricts every request to `https://api.cloudflare.com/client/v4/…` (absolute URLs, other hosts, protocol-relative `//host`, userinfo, backslashes, and `..` traversal are all rejected before any network call).
 
+## Workers: secrets and deploys
+
+Two account-scoped Workers tools sit alongside the DNS tools. Both are **off by default** and each has its own operator opt-in (env vars), read fresh on every call, mirroring the passthrough's "operator switch + per-call `confirm`" model. Workers endpoints are account-scoped, so they need an account ID: pass `account_id` per call, set `CLOUDFLARE_ACCOUNT_ID`, or let the tool fall back to the token's sole visible account (it errors and lists the accounts if the token can see more than one).
+
+### `cloudflare_set_worker_secret_from_env`
+
+Sets a Worker secret whose **value is read from this server's own environment**. The security property is that **the secret value never passes through the model**: the model only names *which* allowlisted env var to read, and the value is never included in the tool call, the text output, `structuredContent`, or any log line — on success or on any error path. (`structuredContent` is built from a fixed field list — `account_id`, `script_name`, `secret_name`, `source_env_var` — never by spreading Cloudflare's response, and the tool scrubs any exact occurrence of the value out of a Cloudflare-forwarded error as defense-in-depth.)
+
+It is gated by **two** allowlists, both empty by default (⇒ the tool refuses every call):
+
+| Env var | Purpose |
+| --- | --- |
+| `CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST` | Comma-separated env var **names** the tool may read (e.g. `STICKER_IT_KEY`). Exact, **case-sensitive** match; entries are trimmed. |
+| `CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST` | Comma-separated Worker script **names** that may *receive* a secret (e.g. `sticker-it-worker`). Exact, case-sensitive match. |
+
+A **hard denylist** — `CLOUDFLARE_API_TOKEN`, `MCP_AUTH_TOKEN`, `ALLOW_UNAUTHENTICATED` — can **never** be exposed as a secret, even if one is mistakenly added to the env allowlist (a name on both lists is denied). If the named env var is unset or empty, the tool errors without ever printing a value (there is none).
+
+### `cloudflare_deploy_worker`
+
+Uploads/deploys a Worker script via `multipart/form-data` (metadata part + script module part). Deploying a Worker runs arbitrary JavaScript with outbound network egress inside the Cloudflare account, so it is disabled unless the operator sets `CLOUDFLARE_WORKERS_DEPLOY_ENABLE=true` (the exact string; a typo or wrong case never enables it) **and** each call sends `confirm=true`. Do **not** embed secrets in the deployed code — anyone who can read the Worker can read them.
+
+**Separation of duties:** a script listed in `CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST` — i.e. one that may *receive* an env-sourced secret — is **refused** by `cloudflare_deploy_worker`. The same Worker can never be both authored by the model here and handed an allowlisted secret. Deploy secret-bearing Workers out-of-band (Cloudflare dashboard or `wrangler`); then set their secrets with `cloudflare_set_worker_secret_from_env`. See [Residual risk](#residual-risk-read-this) below.
+
+The multipart format is verified against Cloudflare's current docs: `PUT /accounts/{account_id}/workers/scripts/{script_name}` with a `metadata` part (`application/json`) plus a script part. For ES modules the metadata is `{ main_module, … }` and the script part (field name = `main_module`) uses `application/javascript+module`; for the service-worker format the metadata is `{ body_part, … }` and the script part uses `application/javascript`. The multipart `Content-Type` boundary is set by the runtime (undici), never by hand.
+
+### Residual risk (read this)
+
+`confirm=true` is set by the **model** in its own tool call — it is **not** a verified human approval, and it provides **no** protection against a model that is itself compromised or prompt-injected. Only the operator opt-ins limit the blast radius:
+
+- **Separation of duties is the structural invariant.** The obvious attack is a model that can both deploy Workers and set secrets: it deploys attacker-authored code, binds an allowlisted secret to it, and lets that Worker exfiltrate the value over its own network egress. This is blocked by making the two capabilities mutually exclusive on any one script:
+  - A script listed in `CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST` **can receive** an env-sourced secret (via `cloudflare_set_worker_secret_from_env`) but **cannot be deployed** by `cloudflare_deploy_worker` — the deploy tool refuses that script name up front, regardless of `confirm`.
+  - A script the model **can deploy** is, by that same refusal, never in the secret allowlist, so it **can never receive** an allowlisted secret.
+
+  Therefore the model can never both author a Worker's code **and** bind an allowlisted secret to it. Operationally this means: deploy secret-bearing Workers **out-of-band** (Cloudflare dashboard or `wrangler`), then use `cloudflare_set_worker_secret_from_env` to set their secrets — a secret only ever lands on code the operator deployed, never on code the model wrote. The **env allowlist** additionally limits *which* secrets exist at all, and the **deploy opt-in** keeps arbitrary-code deployment off unless the operator turns it on.
+- The Cloudflare **token scope remains the real boundary.** Keep it as narrow as the work allows: a token without Workers permissions makes both tools inert regardless of the env vars, and a narrow token caps the worst case even if every opt-in is enabled. Treat enabling `CLOUDFLARE_WORKERS_DEPLOY_ENABLE` as equivalent to granting the ability to run arbitrary code within whatever the token permits.
+
 ## Development
 
 ```bash
 npm run build    # compile TypeScript → dist/
 npm start        # run HTTP server
-npm test         # unit tests for the passthrough guards (SSRF path validator + mode resolver)
+npm test         # unit tests: passthrough guards (SSRF path validator + mode resolver), the Worker-secret env/script allowlist resolvers, the deploy opt-in, and the multipart metadata builder
 npm run smoke    # end-to-end client test against the running server
 ```
 
