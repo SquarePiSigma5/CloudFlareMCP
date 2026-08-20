@@ -5,10 +5,13 @@ import {
   DnsRecord,
   SlimRecord,
   Zone,
+  buildWorkerUploadPlan,
   cfApiPassthrough,
   cfRequest,
+  cfRequestForm,
   cfRequestText,
   formatRecordLine,
+  resolveAccountId,
   slimRecord,
   truncate,
   validateApiPath,
@@ -68,6 +71,98 @@ export function resolvePassthroughMode(raw: string | undefined): PassthroughMode
   return "read";
 }
 
+// ====================================================================
+// Workers tools (#10 set-secret-from-env, #11 deploy) — operator gates.
+//
+// These live behind their own env-var opt-ins, mirroring the passthrough's "operator switch +
+// per-call confirm" model. NONE of them is enabled by simply deploying the server:
+//   - CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST   which server env var NAMES may become secrets
+//   - CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST which Worker script NAMES may receive a secret
+//   - CLOUDFLARE_WORKERS_DEPLOY_ENABLE=true     lets cloudflare_deploy_worker run at all
+// All matching is EXACT-STRING and CASE-SENSITIVE (POSIX env-var and Cloudflare script names are
+// case-sensitive); the only normalization is trimming list entries.
+// ====================================================================
+
+/**
+ * Env var names that must NEVER be exposable as a Worker secret, even if an operator mistakenly adds
+ * one to the allowlist. These are the server's own trust boundary (the Cloudflare token, the MCP
+ * bearer token, the unauthenticated-bind override) — leaking any of them defeats the whole model.
+ */
+export const WORKER_SECRET_ENV_DENYLIST: readonly string[] = ["CLOUDFLARE_API_TOKEN", "MCP_AUTH_TOKEN", "ALLOW_UNAUTHENTICATED"];
+
+/** Parse a comma-separated allowlist env value into trimmed, non-empty names (order-preserving). */
+export function parseEnvAllowlist(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** Outcome of deciding whether one env var may be read as a Worker secret. */
+export type EnvVarAccess = { ok: true } | { ok: false; reason: "disabled" | "denylisted" | "not-allowlisted" };
+
+/**
+ * PURE decision for whether `envVar` may be read from the server environment as a Worker secret.
+ *
+ * Precedence (fail-closed): an EMPTY allowlist disables the feature entirely ("disabled"); a
+ * denylisted name is refused even when it also appears in the allowlist ("denylisted"); otherwise the
+ * name must be an EXACT, case-sensitive member of the allowlist ("not-allowlisted" if absent).
+ * No process.env is read here — the caller passes the raw allowlist string — so it is unit-testable.
+ */
+export function resolveEnvVarAccess(envVar: string, allowlistRaw: string | undefined): EnvVarAccess {
+  const allowlist = parseEnvAllowlist(allowlistRaw);
+  if (allowlist.length === 0) return { ok: false, reason: "disabled" };
+  if (WORKER_SECRET_ENV_DENYLIST.includes(envVar)) return { ok: false, reason: "denylisted" };
+  if (!allowlist.includes(envVar)) return { ok: false, reason: "not-allowlisted" };
+  return { ok: true };
+}
+
+/** Parse the script-name allowlist env value into trimmed, non-empty Worker script names. */
+export function parseScriptAllowlist(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * PURE check: may a Worker secret be set on `scriptName`? Fail-closed — an EMPTY allowlist permits NO
+ * script (so a model-deployed script can never receive an allowlisted secret), and membership is an
+ * EXACT, case-sensitive match. The caller passes the raw allowlist string, so this is unit-testable.
+ */
+export function isScriptAllowedForSecret(scriptName: string, allowlistRaw: string | undefined): boolean {
+  const allow = parseScriptAllowlist(allowlistRaw);
+  return allow.length > 0 && allow.includes(scriptName);
+}
+
+/**
+ * PURE gate for cloudflare_deploy_worker. Fail-closed and strict: only an EXACT "true" enables Worker
+ * deploys, so a typo or wrong case ("TRUE", " true", "1") leaves the tool disabled — a mistake can
+ * never widen to enabling arbitrary code deployment.
+ */
+export function isWorkersDeployEnabled(raw: string | undefined): boolean {
+  return raw === "true";
+}
+
+/** Cloudflare Worker script name: a single path segment, letters/digits/underscore/hyphen. */
+const WORKER_SCRIPT_NAME_RE = /^[A-Za-z0-9_-]{1,63}$/;
+/** Worker secret / binding name: a valid environment binding identifier (accessed as env.NAME). */
+const WORKER_SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+/** Server env-var name to read: standard POSIX-style identifier. */
+const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+/** Module/body part filename (may carry an extension, e.g. worker.mjs). */
+const MODULE_NAME_RE = /^[A-Za-z0-9_.-]{1,128}$/;
+
+const scriptNameParam = z
+  .string()
+  .regex(WORKER_SCRIPT_NAME_RE, "Worker script name must be 1-63 chars of letters, digits, '_' or '-'.")
+  .describe("Cloudflare Worker script name (letters, digits, '_' or '-'). This is a single path segment.");
+
+const accountIdParam = z
+  .string()
+  .regex(/^[0-9a-fA-F]{32}$/, "account_id must be a 32-character hex Cloudflare account ID.")
+  .describe("Cloudflare account ID (32-char hex). Optional — falls back to CLOUDFLARE_ACCOUNT_ID or the token's sole account.");
+
 const zoneParam = z
   .string()
   .min(1)
@@ -116,6 +211,29 @@ function fail(err: unknown): ToolResult {
 async function getRecord(zone: Zone, recordId: string): Promise<DnsRecord> {
   const { result } = await cfRequest<DnsRecord>("GET", `/zones/${zone.id}/dns_records/${recordId}`);
   return result;
+}
+
+/**
+ * Defense-in-depth for cloudflare_set_worker_secret_from_env: return a copy of `err` with every exact
+ * occurrence of the secret value replaced by a placeholder. The tool never puts the value into an error
+ * itself, but cfRequest forwards Cloudflare's own errors[].message verbatim — and if that endpoint ever
+ * echoed part of the submitted body in a validation error, the value would flow straight to the model
+ * via fail(). Scrubbing here blocks that path regardless of what Cloudflare's API is confirmed to do.
+ * String split/join (not a regex) so a value containing regex metacharacters is handled literally.
+ */
+function scrubSecret(err: unknown, secret: string): unknown {
+  if (!secret) return err;
+  const redacted = "[REDACTED]";
+  if (err instanceof CloudflareApiError) {
+    const scrubbedErrors = err.errors?.map((e) => ({ ...e, message: e.message.split(secret).join(redacted) }));
+    return new CloudflareApiError(err.message.split(secret).join(redacted), err.status, scrubbedErrors);
+  }
+  if (err instanceof Error) {
+    const next = new Error(err.message.split(secret).join(redacted));
+    next.name = err.name;
+    return next;
+  }
+  return err;
 }
 
 export function registerTools(server: McpServer): void {
@@ -638,6 +756,254 @@ Safety: confirm=true is set by the model in its own tool call — it is NOT a ve
       }
     },
   );
+
+  // ------------------------------------------------------------------
+  // Tool #10: set a Worker secret whose VALUE is read from the SERVER's own environment. The model
+  // only names WHICH allowlisted env var to read — the value never appears in the tool call, output,
+  // structuredContent, or any log. Registered unconditionally so the two allowlists are read at CALL
+  // time (like the passthrough mode); with either allowlist empty every call is refused.
+  server.registerTool(
+    "cloudflare_set_worker_secret_from_env",
+    {
+      title: "Set Worker Secret from Server Env",
+      description: `Set a Cloudflare Worker secret whose VALUE is read from THIS SERVER's own environment — the secret value never passes through the model, this tool call, the response, or any log. The model only names WHICH allowlisted server env var to read and which Worker/binding to set.
+
+Args:
+  - script_name (string): the Worker script to set the secret on. Must be in CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST.
+  - secret_name (string): the secret's binding name inside the Worker (accessed as env.<secret_name>).
+  - env_var (string): the name of the server env var whose value becomes the secret. Must be in CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST and not on the hard denylist.
+  - account_id (optional string): 32-char account ID; defaults to CLOUDFLARE_ACCOUNT_ID or the token's sole account.
+  - confirm (boolean): must be true — acknowledges a write to the live account.
+
+Two operator opt-ins gate this (both empty by default ⇒ disabled):
+  - CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST: comma-separated env var NAMES the tool may read (e.g. "STICKER_IT_KEY").
+  - CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST: comma-separated Worker script NAMES that may receive a secret.
+The env-var names CLOUDFLARE_API_TOKEN, MCP_AUTH_TOKEN, and ALLOW_UNAUTHENTICATED can NEVER be exposed, even if allowlisted.
+
+Safety: confirm=true is set by the model in its own tool call — it is NOT a verified human approval. The allowlists are the real gate: a value can only be read from an operator-approved env var and can only land on an operator-approved script.`,
+      inputSchema: {
+        script_name: scriptNameParam,
+        secret_name: z
+          .string()
+          .regex(WORKER_SECRET_NAME_RE, "secret_name must be a valid binding identifier (letter/underscore first, then letters/digits/underscore).")
+          .describe("The secret's binding name inside the Worker (accessed as env.<secret_name>)."),
+        env_var: z
+          .string()
+          .regex(ENV_VAR_NAME_RE, "env_var must be a valid environment variable name.")
+          .describe("Name of the server env var whose value becomes the secret. Must be in CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST."),
+        account_id: accountIdParam.optional(),
+        // Strict boolean ON PURPOSE (never z.coerce.boolean(), which treats the string "false" as true).
+        confirm: z.boolean().describe("Must be true. Confirms writing the secret to the live Cloudflare account."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ script_name, secret_name, env_var, account_id, confirm }): Promise<ToolResult> => {
+      try {
+        const allowlistRaw = process.env.CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST;
+        const scriptAllowlistRaw = process.env.CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST;
+
+        // 1. Feature disabled unless the operator opted in with an env-var allowlist. This refusal
+        //    reveals nothing about any configured name.
+        if (parseEnvAllowlist(allowlistRaw).length === 0) {
+          throw new CloudflareApiError(
+            "Setting Worker secrets from the server environment is disabled. Set " +
+              "CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST to the env var name(s) permitted (e.g. STICKER_IT_KEY).",
+          );
+        }
+        // 1b. Paired opt-in: a secret can only land on an operator-approved script. Empty ⇒ no script
+        //     is approved, so a model-deployed Worker can never receive an allowlisted secret.
+        if (parseScriptAllowlist(scriptAllowlistRaw).length === 0) {
+          throw new CloudflareApiError(
+            "Setting Worker secrets is disabled because no target script is approved. Set " +
+              "CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST to the Worker script name(s) permitted to receive secrets.",
+          );
+        }
+
+        // 2. Confirm-first (matches cloudflare_delete_dns_record): an unconfirmed write is refused
+        //    BEFORE any name-specific check, so it can't be used to probe which env vars exist.
+        if (confirm !== true) {
+          throw new CloudflareApiError(
+            "Not confirmed. Re-call with confirm=true to set the Worker secret. Note: confirm is set by the " +
+              "model in its own tool call — it is NOT a verified human approval; the allowlists are the real gate.",
+          );
+        }
+
+        // 3. env_var must be allowlisted and not denylisted. This message names ONLY env_var — never
+        //    any other configured env var name or value.
+        const access = resolveEnvVarAccess(env_var, allowlistRaw);
+        if (!access.ok) {
+          if (access.reason === "denylisted") {
+            throw new CloudflareApiError(`'${env_var}' can never be exposed as a Worker secret.`);
+          }
+          throw new CloudflareApiError(`env var '${env_var}' is not in CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST.`);
+        }
+
+        // 4. script_name must be an operator-approved target.
+        if (!isScriptAllowedForSecret(script_name, scriptAllowlistRaw)) {
+          throw new CloudflareApiError(
+            `Worker script '${script_name}' is not in CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST — a secret can ` +
+              "only be set on a script the operator explicitly approved.",
+          );
+        }
+
+        // 5. Read the value from the server env. It is never printed on any path.
+        const value = process.env[env_var];
+        if (value === undefined || value === "") {
+          throw new CloudflareApiError(`allowlisted env var '${env_var}' is not set in the server environment.`);
+        }
+
+        // 6. Resolve the account and PUT the secret. The request body carries the value; scrub the
+        //    value out of any error before it can reach the model via fail().
+        const accountId = await resolveAccountId(account_id);
+        try {
+          await cfRequest<{ name: string; type: string }>("PUT", `/accounts/${accountId}/workers/scripts/${script_name}/secrets`, {
+            body: { name: secret_name, text: value, type: "secret_text" },
+          });
+        } catch (err) {
+          throw scrubSecret(err, value);
+        }
+
+        // 7. Success — the value is NEVER included. structuredContent is a HARDCODED field list (never
+        //    a spread of the Cloudflare response), so no response field can smuggle extra data through.
+        return ok(
+          `Set secret '${secret_name}' on Worker '${script_name}' from server env var '${env_var}' (value not shown).`,
+          { account_id: accountId, script_name, secret_name, source_env_var: env_var },
+        );
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // ------------------------------------------------------------------
+  // Tool #11: upload/deploy a Worker script via multipart/form-data. Gated by an explicit operator
+  // opt-in (CLOUDFLARE_WORKERS_DEPLOY_ENABLE=true) PLUS confirm=true — this can run arbitrary
+  // attacker-authored JavaScript with network egress inside the account, so it is off by default.
+  server.registerTool(
+    "cloudflare_deploy_worker",
+    {
+      title: "Deploy Cloudflare Worker",
+      description: `Upload and deploy a Cloudflare Worker script (multipart upload). This runs the given JavaScript inside the Cloudflare account, so it is disabled unless the operator opts in.
+
+Separation of duties: a script listed in CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST (i.e. one that may RECEIVE an env-sourced secret via cloudflare_set_worker_secret_from_env) is REFUSED by this tool — the same code can never be both model-authored here AND handed an allowlisted secret. Deploy secret-bearing Workers out-of-band (Cloudflare dashboard or wrangler), then set their secrets with cloudflare_set_worker_secret_from_env. Do NOT embed secrets (API keys, tokens) in the deployed code — anyone who can read the Worker can read them.
+
+Args:
+  - script_name (string): the Worker script name.
+  - script (string): the Worker source code. (Passing code through the model is fine — it is not a secret.)
+  - main_module (string, default "worker.js"): entrypoint module filename (esm) / script part name.
+  - module_type ("esm" | "service_worker", default "esm"): module format.
+  - compatibility_date (optional string, e.g. "2024-11-01").
+  - compatibility_flags (optional string[]).
+  - bindings (optional array of objects): passed through into metadata.bindings (e.g. KV, secret_text, plain_text).
+  - account_id (optional string): 32-char account ID; defaults to CLOUDFLARE_ACCOUNT_ID or the token's sole account.
+  - confirm (boolean): must be true — acknowledges deploying live code.
+
+Operator opt-in: CLOUDFLARE_WORKERS_DEPLOY_ENABLE=true must be set (default: disabled). Safety: confirm=true is set by the model in its own tool call — it is NOT a verified human approval; the env-var opt-in is the real gate. Treat enabling it as granting the ability to run arbitrary code within the token's Cloudflare scope, so keep the token narrow.`,
+      inputSchema: {
+        script_name: scriptNameParam,
+        script: z.string().min(1).max(5_000_000).describe("The Worker source code."),
+        main_module: z
+          .string()
+          .regex(MODULE_NAME_RE, "main_module must be a valid module filename (letters, digits, '.', '_', '-').")
+          .default("worker.js")
+          .describe("Entrypoint module filename (esm) / script part name. Default 'worker.js'."),
+        module_type: z.enum(["esm", "service_worker"]).default("esm").describe("Module format. Default 'esm'."),
+        compatibility_date: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/, "compatibility_date must be YYYY-MM-DD.")
+          .optional()
+          .describe("Runtime compatibility date, e.g. '2024-11-01'."),
+        compatibility_flags: z.array(z.string()).optional().describe("Runtime compatibility flags."),
+        bindings: z
+          .array(z.record(z.unknown()))
+          .optional()
+          .describe("Binding objects passed through into metadata.bindings (e.g. { type:'kv_namespace', name:'KV', namespace_id:'...' })."),
+        account_id: accountIdParam.optional(),
+        // Strict boolean ON PURPOSE (never z.coerce.boolean()).
+        confirm: z.boolean().describe("Must be true. Confirms deploying live code to the Cloudflare account."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ script_name, script, main_module, module_type, compatibility_date, compatibility_flags, bindings, account_id, confirm }): Promise<ToolResult> => {
+      try {
+        // 1. Operator opt-in (two-factor with confirm, mirroring the passthrough's 'full' mode).
+        if (!isWorkersDeployEnabled(process.env.CLOUDFLARE_WORKERS_DEPLOY_ENABLE)) {
+          throw new CloudflareApiError(
+            "Deploying Workers is disabled. Set CLOUDFLARE_WORKERS_DEPLOY_ENABLE=true in the server's environment " +
+              "to allow it (each deploy still requires confirm=true). This tool can run arbitrary JavaScript with " +
+              "network egress inside the Cloudflare account, so keep the token narrowly scoped.",
+          );
+        }
+        // 2. Confirm-first.
+        if (confirm !== true) {
+          throw new CloudflareApiError(
+            "Not confirmed. Re-call with confirm=true to deploy the Worker. Note: confirm is set by the model in " +
+              "its own tool call — it is NOT a verified human approval; CLOUDFLARE_WORKERS_DEPLOY_ENABLE is the real gate.",
+          );
+        }
+
+        // 3. Separation of duties (hard structural gate — runs regardless of confirm): a script that
+        //    may RECEIVE an env-sourced secret must NOT be deployable by this tool. Otherwise the model
+        //    could deploy attacker-authored code to an allowlisted script name and then bind the
+        //    allowlisted secret to it, letting the Worker's own network egress exfiltrate the value.
+        //    Refusing here means a secret only ever lands on code the operator deployed out-of-band.
+        if (isScriptAllowedForSecret(script_name, process.env.CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST)) {
+          throw new CloudflareApiError(
+            `Worker '${script_name}' is reserved for receiving an env-sourced secret (it is listed in ` +
+              "CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST) and cannot be deployed by this tool. To keep the secret " +
+              "away from model-authored code, deploy secret-bearing Workers out-of-band (Cloudflare dashboard or " +
+              "wrangler); this tool deploys only Workers that never receive an allowlisted secret.",
+          );
+        }
+
+        // Build the multipart layout from the PURE builder, then assemble the FormData from it. The
+        // Content-Type (with boundary) is set by undici — never manually — inside cfRequestForm/doFetch.
+        const plan = buildWorkerUploadPlan({
+          mainModule: main_module,
+          moduleType: module_type,
+          compatibilityDate: compatibility_date,
+          compatibilityFlags: compatibility_flags,
+          bindings,
+        });
+        const form = new FormData();
+        for (const part of plan.parts) {
+          const value = part.role === "metadata" ? JSON.stringify(plan.metadata) : script;
+          const blob = new Blob([value], { type: part.contentType });
+          if (part.filename !== undefined) form.append(part.field, blob, part.filename);
+          else form.append(part.field, blob);
+        }
+
+        const accountId = await resolveAccountId(account_id);
+        const { result } = await cfRequestForm<{ id?: string; etag?: string; created_on?: string; modified_on?: string; startup_time_ms?: number }>(
+          "PUT",
+          `/accounts/${accountId}/workers/scripts/${script_name}`,
+          form,
+        );
+        const summary: Record<string, unknown> = {
+          account_id: accountId,
+          script_name,
+          module_type,
+          main_module,
+          ...(result?.id ? { id: result.id } : {}),
+          ...(result?.etag ? { etag: result.etag } : {}),
+          ...(result?.created_on ? { created_on: result.created_on } : {}),
+          ...(result?.modified_on ? { modified_on: result.modified_on } : {}),
+          ...(result?.startup_time_ms !== undefined ? { startup_time_ms: result.startup_time_ms } : {}),
+        };
+        return ok(
+          `Deployed Worker '${script_name}' (${module_type}, entry ${main_module}) to account ${accountId}.` +
+            (result?.id ? ` id=${result.id}` : "") +
+            (result?.etag ? ` etag=${result.etag}` : "") +
+            "\nReminder: do not embed secrets in the code. This Worker is NOT in CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST " +
+            "(that is why it was deployable here), so it cannot receive an env-sourced secret via " +
+            "cloudflare_set_worker_secret_from_env; a Worker that needs an allowlisted secret must be deployed out-of-band.",
+          summary,
+        );
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
 }
 
-export const TOOL_COUNT = 9;
+export const TOOL_COUNT = 11;
