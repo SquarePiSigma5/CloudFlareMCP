@@ -181,8 +181,8 @@ It is gated by **two** allowlists, both empty by default (⇒ the tool refuses e
 
 | Env var | Purpose |
 | --- | --- |
-| `CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST` | Comma-separated env var **names** the tool may read (e.g. `STICKER_IT_KEY`). Exact, **case-sensitive** match; entries are trimmed. |
-| `CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST` | Comma-separated Worker script **names** that may *receive* a secret (e.g. `sticker-it-worker`). Exact, case-sensitive match. |
+| `CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST` | Comma-separated env var **names** the tool may read (e.g. `MY_SERVICE_API_KEY`). Exact, **case-sensitive** match; entries are trimmed. |
+| `CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST` | Comma-separated Worker script **names** that may *receive* a secret (e.g. `my-worker`). Exact, case-sensitive match. |
 
 A **hard denylist** — `CLOUDFLARE_API_TOKEN`, `MCP_AUTH_TOKEN`, `ALLOW_UNAUTHENTICATED` — can **never** be exposed as a secret, even if one is mistakenly added to the env allowlist (a name on both lists is denied). If the named env var is unset or empty, the tool errors without ever printing a value (there is none).
 

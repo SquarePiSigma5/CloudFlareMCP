@@ -82,7 +82,7 @@ test("resolvePassthroughMode: unset and unrecognized resolve to the 'read' defau
 
 test("resolveEnvVarAccess: empty/unset allowlist denies ALL (feature disabled)", () => {
   for (const raw of [undefined, "", "   ", " , , "]) {
-    const d = resolveEnvVarAccess("STICKER_IT_KEY", raw);
+    const d = resolveEnvVarAccess("MY_SERVICE_API_KEY", raw);
     assert.equal(d.ok, false);
     assert.equal(d.reason, "disabled", `expected 'disabled' for ${JSON.stringify(raw)}`);
   }
@@ -91,7 +91,7 @@ test("resolveEnvVarAccess: empty/unset allowlist denies ALL (feature disabled)",
 test("resolveEnvVarAccess: denylisted names are rejected even when allowlisted", () => {
   for (const name of WORKER_SECRET_ENV_DENYLIST) {
     // Put the denylisted name IN the allowlist alongside a benign one — deny must still win.
-    const d = resolveEnvVarAccess(name, `STICKER_IT_KEY, ${name}`);
+    const d = resolveEnvVarAccess(name, `MY_SERVICE_API_KEY, ${name}`);
     assert.equal(d.ok, false);
     assert.equal(d.reason, "denylisted", `expected 'denylisted' for ${name}`);
   }
@@ -101,20 +101,20 @@ test("resolveEnvVarAccess: denylisted names are rejected even when allowlisted",
 });
 
 test("resolveEnvVarAccess: exact allowlisted name is permitted", () => {
-  assert.deepEqual(resolveEnvVarAccess("STICKER_IT_KEY", "STICKER_IT_KEY"), { ok: true });
+  assert.deepEqual(resolveEnvVarAccess("MY_SERVICE_API_KEY", "MY_SERVICE_API_KEY"), { ok: true });
   // Whitespace around entries is trimmed, so a padded list still matches.
-  assert.deepEqual(resolveEnvVarAccess("STICKER_IT_KEY", "  FOO , STICKER_IT_KEY ,BAR "), { ok: true });
+  assert.deepEqual(resolveEnvVarAccess("MY_SERVICE_API_KEY", "  FOO , MY_SERVICE_API_KEY ,BAR "), { ok: true });
 });
 
 test("resolveEnvVarAccess: a name not in the allowlist is refused (not vacuous — allow vs deny differ)", () => {
-  const d = resolveEnvVarAccess("OTHER_KEY", "STICKER_IT_KEY,FOO");
+  const d = resolveEnvVarAccess("OTHER_KEY", "MY_SERVICE_API_KEY,FOO");
   assert.equal(d.ok, false);
   assert.equal(d.reason, "not-allowlisted");
 });
 
 test("resolveEnvVarAccess: matching is CASE-SENSITIVE (same name, different case = non-match)", () => {
-  // 'sticker_it_key' must NOT match an allowlist of 'STICKER_IT_KEY'.
-  const d = resolveEnvVarAccess("sticker_it_key", "STICKER_IT_KEY");
+  // 'my_service_api_key' must NOT match an allowlist of 'MY_SERVICE_API_KEY'.
+  const d = resolveEnvVarAccess("my_service_api_key", "MY_SERVICE_API_KEY");
   assert.equal(d.ok, false);
   assert.equal(d.reason, "not-allowlisted");
 });
@@ -129,15 +129,15 @@ test("parseEnvAllowlist: trims, drops empties, preserves exact names", () => {
 
 test("isScriptAllowedForSecret: empty/unset allowlist permits NO script (fail-closed)", () => {
   for (const raw of [undefined, "", "  "]) {
-    assert.equal(isScriptAllowedForSecret("sticker-it-worker", raw), false, `expected false for ${JSON.stringify(raw)}`);
+    assert.equal(isScriptAllowedForSecret("my-worker", raw), false, `expected false for ${JSON.stringify(raw)}`);
   }
 });
 
 test("isScriptAllowedForSecret: exact, case-sensitive, trimmed membership", () => {
-  assert.equal(isScriptAllowedForSecret("sticker-it-worker", "sticker-it-worker"), true);
-  assert.equal(isScriptAllowedForSecret("sticker-it-worker", " a , sticker-it-worker , b "), true);
-  assert.equal(isScriptAllowedForSecret("other-worker", "sticker-it-worker"), false);
-  assert.equal(isScriptAllowedForSecret("Sticker-It-Worker", "sticker-it-worker"), false); // case-sensitive
+  assert.equal(isScriptAllowedForSecret("my-worker", "my-worker"), true);
+  assert.equal(isScriptAllowedForSecret("my-worker", " a , my-worker , b "), true);
+  assert.equal(isScriptAllowedForSecret("other-worker", "my-worker"), false);
+  assert.equal(isScriptAllowedForSecret("My-Worker", "my-worker"), false); // case-sensitive
 });
 
 test("parseScriptAllowlist: trims and drops empties", () => {
