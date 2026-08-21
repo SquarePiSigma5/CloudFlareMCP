@@ -776,7 +776,7 @@ Args:
   - confirm (boolean): must be true — acknowledges a write to the live account.
 
 Two operator opt-ins gate this (both empty by default ⇒ disabled):
-  - CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST: comma-separated env var NAMES the tool may read (e.g. "STICKER_IT_KEY").
+  - CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST: comma-separated env var NAMES the tool may read (e.g. "MY_SERVICE_API_KEY").
   - CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST: comma-separated Worker script NAMES that may receive a secret.
 The env-var names CLOUDFLARE_API_TOKEN, MCP_AUTH_TOKEN, and ALLOW_UNAUTHENTICATED can NEVER be exposed, even if allowlisted.
 
@@ -807,7 +807,7 @@ Safety: confirm=true is set by the model in its own tool call — it is NOT a ve
         if (parseEnvAllowlist(allowlistRaw).length === 0) {
           throw new CloudflareApiError(
             "Setting Worker secrets from the server environment is disabled. Set " +
-              "CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST to the env var name(s) permitted (e.g. STICKER_IT_KEY).",
+              "CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST to the env var name(s) permitted (e.g. MY_SERVICE_API_KEY).",
           );
         }
         // 1b. Paired opt-in: a secret can only land on an operator-approved script. Empty ⇒ no script
