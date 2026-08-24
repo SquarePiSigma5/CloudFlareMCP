@@ -1,7 +1,10 @@
 /**
  * Shared Cloudflare API client for the MCP server.
- * Auth: CLOUDFLARE_API_TOKEN env var (scoped token, never the Global API Key).
+ * Auth: single-tenant → CLOUDFLARE_API_TOKEN env var (scoped token, never the Global API Key).
+ *       gateway mode  → the per-request token bound in the AsyncLocalStorage context (gateway/context).
  */
+import { createHash } from "node:crypto";
+import { gatewayEnabled, getRequestToken } from "./gateway/context.js";
 
 const API_BASE = "https://api.cloudflare.com/client/v4";
 const API_BASE_URL = new URL(API_BASE);
@@ -80,7 +83,29 @@ export class CloudflareApiError extends Error {
   }
 }
 
-function apiToken(): string {
+/**
+ * Resolve the Cloudflare bearer token for the CURRENT request.
+ *
+ * Gateway mode (GATEWAY_ENABLE=true) FAILS CLOSED: it uses ONLY the per-request token bound in the
+ * AsyncLocalStorage context and throws if none is present. It deliberately NEVER falls back to
+ * process.env.CLOUDFLARE_API_TOKEN — in a multi-tenant process that global token would be the wrong
+ * agent's (or a privileged) token, so silently using it is a cross-tenant credential leak. The env
+ * fallback is allowed ONLY in single-tenant mode, where there is exactly one token for the process.
+ *
+ * Exported so the gateway-mode behavior is unit-testable without a live network call.
+ */
+export function apiToken(): string {
+  if (gatewayEnabled()) {
+    const token = getRequestToken();
+    if (!token) {
+      throw new CloudflareApiError(
+        "Gateway mode is enabled (GATEWAY_ENABLE=true) but no per-request Cloudflare token is bound to this " +
+          "request. Every request must run inside runWithToken() with the authenticated agent's resolved token. " +
+          "The global CLOUDFLARE_API_TOKEN is intentionally NOT used as a fallback in gateway mode.",
+      );
+    }
+    return token;
+  }
   const token = process.env.CLOUDFLARE_API_TOKEN;
   if (!token) {
     throw new CloudflareApiError(
@@ -370,7 +395,39 @@ export async function cfApiPassthrough(method: string, path: string, opts: Reque
 }
 
 const ZONE_ID_RE = /^[0-9a-f]{32}$/;
-const zoneCache = new Map<string, Zone>();
+
+/**
+ * The zone cache is PER-TENANT, never global, in gateway mode.
+ *
+ * A single global Map would bleed across agents: agent A resolves "example.com" to a zone id, and
+ * agent B — a DIFFERENT Cloudflare account — would then be served A's cached zone. To prevent that,
+ * the active tenant is identified by sha256(current request token) and each tenant gets its own zone
+ * Map. In single-tenant mode there is no request token, so everything shares one global Map and the
+ * behavior is byte-for-byte identical to before. The token is only ever hashed, never stored in the
+ * clear as a cache key.
+ */
+const globalZoneCache = new Map<string, Zone>();
+const tenantZoneCaches = new Map<string, Map<string, Zone>>();
+
+/** sha256 of the active per-request token when gateway mode has one bound; undefined otherwise. */
+function currentTenantKey(): string | undefined {
+  if (!gatewayEnabled()) return undefined;
+  const token = getRequestToken();
+  if (!token) return undefined;
+  return createHash("sha256").update(token).digest("hex");
+}
+
+/** The zone Map for the active tenant (a fresh per-token Map in gateway mode; the global Map otherwise). */
+function zoneCacheFor(): Map<string, Zone> {
+  const tenant = currentTenantKey();
+  if (!tenant) return globalZoneCache;
+  let cache = tenantZoneCaches.get(tenant);
+  if (!cache) {
+    cache = new Map<string, Zone>();
+    tenantZoneCaches.set(tenant, cache);
+  }
+  return cache;
+}
 
 /** Normalize a zone reference (name or ID) into its cache key: trimmed, lowercased, no trailing dot. */
 function normalizeZoneKey(zone: string): string {
@@ -386,13 +443,14 @@ export async function resolveZone(zone: string): Promise<Zone> {
   if (!key) {
     throw new CloudflareApiError("Empty zone. Pass a domain name (e.g. 'example.com') or a 32-character zone ID.");
   }
-  const cached = zoneCache.get(key);
+  const cache = zoneCacheFor();
+  const cached = cache.get(key);
   if (cached) return cached;
 
   if (ZONE_ID_RE.test(key)) {
     const { result } = await cfRequest<Zone>("GET", `/zones/${key}`);
-    zoneCache.set(result.id, result);
-    zoneCache.set(result.name.toLowerCase(), result);
+    cache.set(result.id, result);
+    cache.set(result.name.toLowerCase(), result);
     return result;
   }
 
@@ -406,8 +464,8 @@ export async function resolveZone(zone: string): Promise<Zone> {
     );
   }
   const found = result[0];
-  zoneCache.set(found.id, found);
-  zoneCache.set(found.name.toLowerCase(), found);
+  cache.set(found.id, found);
+  cache.set(found.name.toLowerCase(), found);
   return found;
 }
 
@@ -423,14 +481,15 @@ export async function resolveZone(zone: string): Promise<Zone> {
  */
 export async function withZone<T>(zoneRef: string, fn: (zone: Zone) => Promise<T>): Promise<T> {
   const key = normalizeZoneKey(zoneRef);
-  const wasCached = zoneCache.has(key);
+  const cache = zoneCacheFor();
+  const wasCached = cache.has(key);
   const zone = await resolveZone(zoneRef);
   try {
     return await fn(zone);
   } catch (err) {
     if (err instanceof CloudflareApiError && err.status === 404 && wasCached) {
-      zoneCache.delete(zone.id);
-      zoneCache.delete(zone.name.toLowerCase());
+      cache.delete(zone.id);
+      cache.delete(zone.name.toLowerCase());
       const fresh = await resolveZone(zoneRef);
       if (fresh.id === zone.id) {
         // Zone is unchanged — the 404 was about the record, not the cached zone. Rethrow as-is.
@@ -448,8 +507,14 @@ export interface Account {
   name: string;
 }
 
-/** Cached, process-lifetime account id resolved from GET /accounts (only when exactly one exists). */
-let resolvedAccountId: string | undefined;
+/**
+ * Cached single-account id resolved from GET /accounts. PER-TENANT in gateway mode for the same
+ * reason as the zone cache — a global cache would serve one agent's resolved account to another. In
+ * single-tenant mode `currentTenantKey()` is undefined and the process-lifetime global is used, so
+ * behavior is unchanged.
+ */
+let globalResolvedAccountId: string | undefined;
+const tenantResolvedAccountId = new Map<string, string>();
 
 /**
  * Resolve the account id for account-scoped endpoints (Workers).
@@ -457,19 +522,24 @@ let resolvedAccountId: string | undefined;
  * Precedence: an explicit `account_id` argument > CLOUDFLARE_ACCOUNT_ID env > GET /accounts (used only
  * when the token can see exactly one account). Zero or more-than-one visible accounts throw a clear
  * error listing the account names and asking for an explicit account_id, rather than guessing. The
- * single-account lookup is cached for the process so repeated Workers calls don't re-hit /accounts.
+ * single-account lookup is cached (per tenant in gateway mode) so repeated Workers calls don't re-hit
+ * /accounts.
  */
 export async function resolveAccountId(explicit?: string): Promise<string> {
   const fromParam = explicit?.trim();
   if (fromParam) return fromParam;
   const fromEnv = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
   if (fromEnv) return fromEnv;
-  if (resolvedAccountId) return resolvedAccountId;
+  const tenant = currentTenantKey();
+  const cached = tenant ? tenantResolvedAccountId.get(tenant) : globalResolvedAccountId;
+  if (cached) return cached;
 
   const { result } = await cfRequest<Account[]>("GET", "/accounts", { query: { per_page: 50 } });
   if (result.length === 1) {
-    resolvedAccountId = result[0].id;
-    return resolvedAccountId;
+    const id = result[0].id;
+    if (tenant) tenantResolvedAccountId.set(tenant, id);
+    else globalResolvedAccountId = id;
+    return id;
   }
   if (result.length === 0) {
     throw new CloudflareApiError(

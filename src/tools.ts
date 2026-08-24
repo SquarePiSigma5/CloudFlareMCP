@@ -85,10 +85,23 @@ export function resolvePassthroughMode(raw: string | undefined): PassthroughMode
 
 /**
  * Env var names that must NEVER be exposable as a Worker secret, even if an operator mistakenly adds
- * one to the allowlist. These are the server's own trust boundary (the Cloudflare token, the MCP
- * bearer token, the unauthenticated-bind override) — leaking any of them defeats the whole model.
+ * one to the allowlist. These are the server's own trust boundary — leaking any of them defeats the
+ * whole model:
+ *   - CLOUDFLARE_API_TOKEN      the single-tenant Cloudflare token
+ *   - MCP_AUTH_TOKEN            the bearer that gates the /mcp endpoint
+ *   - ALLOW_UNAUTHENTICATED     the non-loopback-bind override
+ *   - GATEWAY_MASTER_PASSPHRASE decrypts EVERY tenant's stored Cloudflare token (gateway file store)
+ *   - ADMIN_PASSWORD            full gateway admin-panel access
+ * The last two are gateway mode's process-wide trust secrets; they are denylisted UNCONDITIONALLY
+ * (harmless when unset, as in single-tenant mode) so a mistaken allowlist entry can never read them out.
  */
-export const WORKER_SECRET_ENV_DENYLIST: readonly string[] = ["CLOUDFLARE_API_TOKEN", "MCP_AUTH_TOKEN", "ALLOW_UNAUTHENTICATED"];
+export const WORKER_SECRET_ENV_DENYLIST: readonly string[] = [
+  "CLOUDFLARE_API_TOKEN",
+  "MCP_AUTH_TOKEN",
+  "ALLOW_UNAUTHENTICATED",
+  "GATEWAY_MASTER_PASSPHRASE",
+  "ADMIN_PASSWORD",
+];
 
 /** Parse a comma-separated allowlist env value into trimmed, non-empty names (order-preserving). */
 export function parseEnvAllowlist(raw: string | undefined): string[] {
@@ -778,7 +791,7 @@ Args:
 Two operator opt-ins gate this (both empty by default ⇒ disabled):
   - CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST: comma-separated env var NAMES the tool may read (e.g. "MY_SERVICE_API_KEY").
   - CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST: comma-separated Worker script NAMES that may receive a secret.
-The env-var names CLOUDFLARE_API_TOKEN, MCP_AUTH_TOKEN, and ALLOW_UNAUTHENTICATED can NEVER be exposed, even if allowlisted.
+The env-var names CLOUDFLARE_API_TOKEN, MCP_AUTH_TOKEN, ALLOW_UNAUTHENTICATED, GATEWAY_MASTER_PASSPHRASE, and ADMIN_PASSWORD can NEVER be exposed, even if allowlisted.
 
 Safety: confirm=true is set by the model in its own tool call — it is NOT a verified human approval. The allowlists are the real gate: a value can only be read from an operator-approved env var and can only land on an operator-approved script.`,
       inputSchema: {

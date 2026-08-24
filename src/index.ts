@@ -7,19 +7,32 @@
  * clients that launch local subprocess servers (TRANSPORT=stdio).
  *
  * Environment:
- *   CLOUDFLARE_API_TOKEN  (required)  scoped Cloudflare API token (Zone → DNS → Edit)
+ *   CLOUDFLARE_API_TOKEN  (required unless gateway mode) scoped Cloudflare API token (Zone → DNS → Edit)
  *   MCP_AUTH_TOKEN        (optional)  if set, HTTP clients must send `Authorization: Bearer <token>`
  *   ALLOW_UNAUTHENTICATED (optional)  'true' permits a non-loopback bind without MCP_AUTH_TOKEN (auth must be terminated upstream)
  *   HOST                  (optional)  bind address, default 127.0.0.1
  *   PORT                  (optional)  default 8787
  *   TRANSPORT             (optional)  'http' (default) or 'stdio'
  *   ALLOWED_ORIGINS       (optional)  comma-separated browser Origins to allow, in addition to localhost
+ *
+ * Gateway (multi-tenant) mode — HTTP transport only (see README "Gateway mode"):
+ *   GATEWAY_ENABLE            'true' turns on per-agent bearer auth; each request runs with its agent's own token
+ *   ADMIN_PORT                localhost-only admin panel port (default 8788)
+ *   ADMIN_PASSWORD            admin-panel password (auto-generated & printed once to stderr if unset)
+ *   GATEWAY_DATA_DIR          directory for agents.json (and, with the file store, the encrypted secrets)
+ *   GATEWAY_SECRET_STORE      'file' forces the encrypted-file backend; otherwise macOS keychain when available
+ *   GATEWAY_MASTER_PASSPHRASE passphrase for the encrypted-file secret store (required when it is used)
+ *   GATEWAY_PUBLIC_URL        optional public base URL of this /mcp server, used in connector snippets
  */
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools, TOOL_COUNT } from "./tools.js";
+import { gatewayEnabled, runWithToken } from "./gateway/context.js";
+import { loadStore, type AgentStore, type Agent } from "./gateway/agents.js";
+import { selectSecretStore, ensureDataDir, type SecretStore } from "./gateway/store.js";
+import { startAdminServer, resolveAdminPassword, extractBearer, DEFAULT_ADMIN_PORT } from "./gateway/admin.js";
 
 const SERVER_NAME = "cloudflare-dns-mcp-server";
 const SERVER_VERSION = "1.0.0";
@@ -75,6 +88,39 @@ async function runHttp(): Promise<void> {
   const app = express();
 
   const authToken = process.env.MCP_AUTH_TOKEN;
+  const gateway = gatewayEnabled();
+
+  // ---- Gateway (multi-tenant) mode setup. Each request is authenticated to ONE agent and runs with
+  // that agent's own Cloudflare token; there is no process-wide MCP_AUTH_TOKEN. The admin panel (a
+  // separate localhost-only server) manages the key/agent tables shared with the /mcp handler here. ----
+  let gatewayCtx: { store: AgentStore; secretStore: SecretStore } | undefined;
+  if (gateway) {
+    const dataDir = process.env.GATEWAY_DATA_DIR;
+    if (!dataDir) {
+      log(
+        "ERROR: gateway mode (GATEWAY_ENABLE=true) requires GATEWAY_DATA_DIR — it holds agents.json (key/agent " +
+          "metadata) and, with GATEWAY_SECRET_STORE=file, the encrypted secrets. Set GATEWAY_DATA_DIR and restart.",
+      );
+      process.exit(1);
+    }
+    // Create the data dir if missing and, unconditionally + best-effort, tighten it to 0700 EVERY
+    // startup — so even a pre-existing operator-created dir left world-readable by a lax umask is
+    // locked down before agents.json / secrets.enc.json (themselves 0600) are written into it.
+    ensureDataDir(dataDir);
+    const store = loadStore(dataDir);
+    const secretStore = selectSecretStore(dataDir);
+    gatewayCtx = { store, secretStore };
+    const adminPassword = resolveAdminPassword(log);
+    const adminPort = Number.parseInt(process.env.ADMIN_PORT ?? String(DEFAULT_ADMIN_PORT), 10);
+    startAdminServer({
+      store,
+      secretStore,
+      password: adminPassword,
+      port: adminPort,
+      publicMcpUrl: process.env.GATEWAY_PUBLIC_URL,
+      log,
+    });
+  }
 
   app.get("/healthz", (_req, res) => {
     res.json({ ok: true, server: SERVER_NAME, version: SERVER_VERSION });
@@ -85,6 +131,21 @@ async function runHttp(): Promise<void> {
     const origin = req.headers.origin;
     if (origin && !originAllowed(origin)) {
       res.status(403).json({ error: "Forbidden: origin not allowed" });
+      return;
+    }
+    if (gatewayCtx) {
+      // Gateway mode: the per-agent bearer table IS the auth. Resolve the presented bearer to an
+      // ENABLED agent (findAgentByBearer skips disabled ones and compares hashes in constant time);
+      // no/unknown/disabled bearer → 401. The resolved agent rides on res.locals to the POST handler.
+      const bearer = extractBearer(typeof req.headers.authorization === "string" ? req.headers.authorization : undefined);
+      const agent = bearer ? gatewayCtx.store.findAgentByBearer(bearer) : undefined;
+      if (!agent) {
+        res.set("WWW-Authenticate", "Bearer");
+        res.status(401).json({ error: "Unauthorized: send 'Authorization: Bearer <agent bearer>'" });
+        return;
+      }
+      (res.locals as { agent?: Agent }).agent = agent;
+      next();
       return;
     }
     if (authToken) {
@@ -103,17 +164,43 @@ async function runHttp(): Promise<void> {
   // runs FIRST — a malformed JSON POST from an unauthenticated client is rejected before parsing.
   app.post("/mcp", express.json({ limit: "1mb" }), async (req, res) => {
     try {
-      const server = buildServer();
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true,
-      });
-      res.on("close", () => {
-        void transport.close();
-        void server.close();
-      });
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
+      // The stateless per-request MCP dance. In gateway mode this runs INSIDE runWithToken so that
+      // apiToken() (cloudflare.ts) picks up the authenticated agent's own Cloudflare token from the
+      // AsyncLocalStorage context — no global token is ever consulted.
+      const handleRequest = async (): Promise<void> => {
+        const server = buildServer();
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined,
+          enableJsonResponse: true,
+        });
+        res.on("close", () => {
+          void transport.close();
+          void server.close();
+        });
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      };
+
+      if (gatewayCtx) {
+        const agent = (res.locals as { agent?: Agent }).agent;
+        if (!agent) {
+          // Should be unreachable — the middleware 401s without a resolved agent — but fail closed.
+          res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+          return;
+        }
+        const token = await gatewayCtx.secretStore.getSecret(agent.key_id);
+        if (!token) {
+          // The agent's key exists in metadata but its secret is unavailable (misconfiguration).
+          log(`gateway: agent '${agent.name}' has no resolvable Cloudflare token for key ${agent.key_id}`);
+          if (!res.headersSent) {
+            res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
+          }
+          return;
+        }
+        await runWithToken({ cloudflareToken: token, agentName: agent.name }, handleRequest);
+      } else {
+        await handleRequest();
+      }
     } catch (err) {
       log("request error:", err);
       if (!res.headersSent) {
@@ -153,7 +240,10 @@ async function runHttp(): Promise<void> {
   // Normalize only for the auth-guard decision — app.listen still gets the user's original HOST.
   const normalizedHost = host.trim().toLowerCase();
   const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-  if (!authToken && !LOOPBACK_HOSTS.has(normalizedHost)) {
+  // In gateway mode the per-agent bearer table authenticates every /mcp request, so it satisfies the
+  // "don't bind non-localhost without auth" guard exactly as MCP_AUTH_TOKEN does in single-tenant mode.
+  const authSatisfied = !!authToken || gateway;
+  if (!authSatisfied && !LOOPBACK_HOSTS.has(normalizedHost)) {
     if (process.env.ALLOW_UNAUTHENTICATED === "true") {
       log(
         "WARNING: server is binding to a non-localhost address without MCP_AUTH_TOKEN set. " +
@@ -171,7 +261,8 @@ async function runHttp(): Promise<void> {
   }
 
   const httpServer = app.listen(port, host, () => {
-    log(`running on http://${host}:${port}/mcp (${TOOL_COUNT} tools, auth ${authToken ? "ON" : "OFF"})`);
+    const authDesc = gateway ? "gateway mode: per-agent bearer auth" : `auth ${authToken ? "ON" : "OFF"}`;
+    log(`running on http://${host}:${port}/mcp (${TOOL_COUNT} tools, ${authDesc})`);
   });
   httpServer.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
@@ -184,14 +275,32 @@ async function runHttp(): Promise<void> {
 }
 
 function main(): void {
-  if (!process.env.CLOUDFLARE_API_TOKEN) {
+  const transport = (process.env.TRANSPORT ?? "http").toLowerCase();
+
+  // Gateway (multi-tenant) mode applies to the HTTP transport only: it selects each agent's Cloudflare
+  // token from a per-request bearer, which stdio (a single local subprocess with one token) has no
+  // notion of. apiToken() also fails closed whenever GATEWAY_ENABLE=true, so a stdio process with the
+  // flag set could not resolve a token at all. Refuse the combination with a clear message rather than
+  // start a broken single-tenant server.
+  if (transport === "stdio" && gatewayEnabled()) {
+    log(
+      "ERROR: GATEWAY_ENABLE=true is not supported with TRANSPORT=stdio. Gateway (multi-tenant) mode runs " +
+        "only over HTTP, where a per-agent bearer selects each agent's Cloudflare token. For a local stdio " +
+        "server, run single-tenant: unset GATEWAY_ENABLE and set CLOUDFLARE_API_TOKEN. For gateway mode, use TRANSPORT=http.",
+    );
+    process.exit(1);
+  }
+
+  // In gateway mode there is no single process-wide Cloudflare token — each agent brings its own — so
+  // CLOUDFLARE_API_TOKEN is not required. Every other configuration still requires it.
+  if (!gatewayEnabled() && !process.env.CLOUDFLARE_API_TOKEN) {
     log(
       "ERROR: CLOUDFLARE_API_TOKEN is not set. Create a scoped token (template 'Edit zone DNS', " +
         "limited to your zones) at https://dash.cloudflare.com/profile/api-tokens and export it before starting.",
     );
     process.exit(1);
   }
-  const transport = (process.env.TRANSPORT ?? "http").toLowerCase();
+
   const run = transport === "stdio" ? runStdio : runHttp;
   run().catch((err) => {
     log("fatal:", err);

@@ -184,7 +184,7 @@ It is gated by **two** allowlists, both empty by default (⇒ the tool refuses e
 | `CLOUDFLARE_WORKER_SECRET_ENV_ALLOWLIST` | Comma-separated env var **names** the tool may read (e.g. `MY_SERVICE_API_KEY`). Exact, **case-sensitive** match; entries are trimmed. |
 | `CLOUDFLARE_WORKER_SECRET_SCRIPT_ALLOWLIST` | Comma-separated Worker script **names** that may *receive* a secret (e.g. `my-worker`). Exact, case-sensitive match. |
 
-A **hard denylist** — `CLOUDFLARE_API_TOKEN`, `MCP_AUTH_TOKEN`, `ALLOW_UNAUTHENTICATED` — can **never** be exposed as a secret, even if one is mistakenly added to the env allowlist (a name on both lists is denied). If the named env var is unset or empty, the tool errors without ever printing a value (there is none).
+A **hard denylist** — `CLOUDFLARE_API_TOKEN`, `MCP_AUTH_TOKEN`, `ALLOW_UNAUTHENTICATED`, `GATEWAY_MASTER_PASSPHRASE`, `ADMIN_PASSWORD` — can **never** be exposed as a secret, even if one is mistakenly added to the env allowlist (a name on both lists is denied). The last two are gateway mode's process-wide trust secrets (the master passphrase decrypts every tenant's stored token; `ADMIN_PASSWORD` is full admin-panel access) and are denied unconditionally. If the named env var is unset or empty, the tool errors without ever printing a value (there is none).
 
 ### `cloudflare_deploy_worker`
 
@@ -205,16 +205,88 @@ The multipart format is verified against Cloudflare's current docs: `PUT /accoun
   Therefore the model can never both author a Worker's code **and** bind an allowlisted secret to it. Operationally this means: deploy secret-bearing Workers **out-of-band** (Cloudflare dashboard or `wrangler`), then use `cloudflare_set_worker_secret_from_env` to set their secrets — a secret only ever lands on code the operator deployed, never on code the model wrote. The **env allowlist** additionally limits *which* secrets exist at all, and the **deploy opt-in** keeps arbitrary-code deployment off unless the operator turns it on.
 - The Cloudflare **token scope remains the real boundary.** Keep it as narrow as the work allows: a token without Workers permissions makes both tools inert regardless of the env vars, and a narrow token caps the worst case even if every opt-in is enabled. Treat enabling `CLOUDFLARE_WORKERS_DEPLOY_ENABLE` as equivalent to granting the ability to run arbitrary code within whatever the token permits.
 
+## Gateway mode: per-agent keys + admin panel
+
+Everything above is **single-tenant**: one process, one `CLOUDFLARE_API_TOKEN`, one shared `MCP_AUTH_TOKEN`. **Gateway mode** (`GATEWAY_ENABLE=true`, HTTP transport only) turns the same server into a **multi-tenant** front door: many agents share one process, but each agent authenticates with its **own bearer token** and acts with its **own Cloudflare token**. No agent can see or use another's credentials, and there is no process-wide Cloudflare token at all. A small **localhost-only admin panel** manages the agents and keys.
+
+Two concepts:
+
+- **Key** — a named Cloudflare API token, stored **encrypted at rest** (never in `agents.json`, never returned by any API, never logged). One key can back several agents.
+- **Agent** — a bearer-authenticated caller bound to one key. The bearer is 256 random bits; only its `sha256` is persisted, and the plaintext is shown **exactly once** (at creation or rotation).
+
+A request to `/mcp` presents `Authorization: Bearer <agent bearer>`. The server resolves it to an enabled agent (constant-time hash comparison; unknown/disabled → `401`), decrypts that agent's key, and runs the tool call with that token bound to an `AsyncLocalStorage` context — so `apiToken()` **fails closed** to the per-request token and **never** falls back to any global env token.
+
+### Environment variables
+
+| Var | Purpose |
+| --- | --- |
+| `GATEWAY_ENABLE` | Exactly `true` enables gateway mode (HTTP only). Any other value stays single-tenant. |
+| `ADMIN_PORT` | Port for the admin panel, bound to `127.0.0.1` only. Default `8788`. **Never** the `/mcp` port. |
+| `ADMIN_PASSWORD` | Password for the admin panel (sent in the `Authorization` header, compared in constant time). If unset, a strong random one is generated and printed **once** to stderr at startup. If you set one shorter than 16 characters, a one-time weakness warning is logged to stderr (never the value itself) — prefer a long random password or leave it unset. |
+| `GATEWAY_DATA_DIR` | Directory holding `agents.json` (key/agent metadata, mode `0600`) and, with the file secret store, `secrets.enc.json` + `secrets.salt`. **Required** in gateway mode. The directory itself is tightened to mode `0700` (best-effort) at every startup, so even a pre-existing dir left world-readable by a lax umask is locked down. |
+| `GATEWAY_SECRET_STORE` | `file` forces the portable AES-256-GCM encrypted-file backend. Otherwise the macOS login keychain is used when available, falling back to the file store. |
+| `GATEWAY_MASTER_PASSPHRASE` | Passphrase for the encrypted-file store; an AES-256 key is derived via `scrypt(N=2¹⁵,r=8,p=1)` with a persisted random 16-byte salt. **Required** whenever the file store is used. |
+| `GATEWAY_PUBLIC_URL` | Optional public base URL of this `/mcp` server (e.g. `https://cf.example.com`). Used only to fill in the ready-to-paste connector snippet; a placeholder host is emitted when unset. |
+
+### Secret storage
+
+Keys are encrypted at rest by one of two interchangeable backends, chosen automatically:
+
+- **macOS keychain** (default on macOS): each token is a generic-password item managed by the OS. Residual risk: the `security add-generic-password -w <secret>` CLI passes the value as an argv element, so for the brief life of that child process it is visible in the process table (`ps`) to other processes of the same user. This is minimized (no shell, single short-lived call, never logged) but cannot be eliminated with that CLI. Operators who can't accept the `ps` window should set `GATEWAY_SECRET_STORE=file`.
+- **Encrypted file** (`GATEWAY_SECRET_STORE=file`, or non-macOS): AES-256-GCM with a random 12-byte IV per secret and a verified auth tag (tampering throws rather than returning corrupt data). The key is derived from `GATEWAY_MASTER_PASSPHRASE` + a persisted random salt. `secrets.enc.json`, `secrets.salt`, and `agents.json` are all created with mode `0600` at open time (never a post-hoc `chmod`), and the enclosing `GATEWAY_DATA_DIR` is tightened to mode `0700` (best-effort) at startup.
+
+### Running it
+
+```bash
+GATEWAY_ENABLE=true \
+GATEWAY_SECRET_STORE=file \
+GATEWAY_MASTER_PASSPHRASE="a-strong-passphrase" \
+GATEWAY_DATA_DIR=/var/lib/cloudflare-mcp \
+ADMIN_PORT=8788 \
+ADMIN_PASSWORD="$(openssl rand -hex 24)" \
+PORT=8787 \
+npm start
+```
+
+`/mcp` serves the tenants on `PORT` (put HTTPS in front, e.g. a Cloudflare Tunnel). The admin panel is at `http://127.0.0.1:8788` — reachable **only** from the machine itself.
+
+### Per-agent connector flow
+
+1. Open `http://127.0.0.1:<ADMIN_PORT>` on the server machine and unlock with `ADMIN_PASSWORD` (held in the tab's memory only).
+2. **Add a key**: give it a name and paste a scoped Cloudflare token (tick *validate* to probe it without echoing it back).
+3. **Create an agent** bound to that key. The panel shows the bearer **once** plus a ready-to-paste connector config:
+
+   ```json
+   {
+     "mcpServers": {
+       "cloudflare-<agent>": {
+         "url": "https://<your-mcp-host>/mcp",
+         "headers": { "Authorization": "Bearer <one-time-bearer>" }
+       }
+     }
+   }
+   ```
+4. Hand that snippet to the agent's operator. **Disable** or **rotate** the agent at any time; a disabled or rotated bearer stops working immediately.
+
+### Security notes (honest)
+
+- **Admin panel is localhost-only, by binding and by check.** It binds `127.0.0.1` (never `0.0.0.0`), requires `ADMIN_PASSWORD` on every `/api/*` call via the `Authorization` header (not cookies), and refuses any request whose `Host` — or `Origin`, when present — is not loopback (anti DNS-rebinding / anti-CSRF). It is never served on the `/mcp` port. To reach it remotely, tunnel it yourself (e.g. SSH port-forward) — do not expose it.
+- **No secret is ever returned or logged.** Not by any admin endpoint, not by any MCP tool. Key secrets live only in the secret store; bearers are stored only as `sha256` and revealed once at mint time.
+- **A bearer is account-level power over one key.** Anyone holding an agent's bearer can do whatever that agent's Cloudflare token permits. Scope each Cloudflare token narrowly — the token is still the real blast-radius boundary — and rotate bearers you suspect are exposed.
+- **The `security` CLI `ps` window** (keychain backend) is the one residual exposure of a secret to same-user processes; use the file store to avoid it.
+- **stdio is single-tenant only.** Over `TRANSPORT=stdio`, gateway mode does not apply and the admin server is not started; setting `GATEWAY_ENABLE=true` with stdio is refused at startup (a local subprocess has one token, selected the single-tenant way).
+- **Single-tenant behavior is unchanged.** With `GATEWAY_ENABLE` unset, the server behaves exactly as documented above — same tools, same `MCP_AUTH_TOKEN` auth, same env token.
+
 ## Development
 
 ```bash
 npm run build    # compile TypeScript → dist/
 npm start        # run HTTP server
-npm test         # unit tests: passthrough guards (SSRF path validator + mode resolver), the Worker-secret env/script allowlist resolvers, the deploy opt-in, and the multipart metadata builder
+npm test         # unit tests: passthrough guards (SSRF path validator + mode resolver), the Worker-secret env/script allowlist resolvers, the deploy opt-in, the multipart metadata builder, and the gateway crypto/store/agents/admin helpers
 npm run smoke    # end-to-end client test against the running server
 ```
 
-Source layout: `src/index.ts` (transports, auth middleware), `src/cloudflare.ts` (API client, zone resolution, formatting), `src/tools.ts` (tool registrations).
+Source layout: `src/index.ts` (transports, auth middleware, gateway wiring), `src/cloudflare.ts` (API client, per-tenant zone resolution, formatting), `src/tools.ts` (tool registrations), `src/gateway/` (multi-tenant mode: `context.ts` request-scoped token, `store.ts` encrypted secret backends, `agents.ts` key/agent metadata, `admin.ts` localhost admin panel).
 
 ## License
 
